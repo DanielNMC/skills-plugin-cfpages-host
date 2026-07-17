@@ -8,5 +8,10 @@
     "name": "web-design-guidelines",
     "url": "https://github.com/vercel-labs/agent-skills/tree/main/skills/web-design-guidelines",
     "files": ["SKILL.md"]
+  },
+  {
+    "name": "animation-vocabulary",
+    "url": "https://github.com/emilkowalski/skills/tree/main/skills/animation-vocabulary",
+    "files": ["SKILL.md"]
   }
 ]

@@ -1,147 +1,120 @@
 # my-skills
 
-> Self-hosted skills registry for Kilo CLI / OpenCode. Private source repo, Cloudflare Pages serves a tarball, consumers install via Bun's tarball URL format. Edit one JSON file, push, every consumer picks it up on next session.
+Self-hosted skills registry for Kilo. Private source repo on GitHub, Cloudflare Pages builds a tarball on every push, consumers install it via Bun's tarball URL format. Edit `skills_list.json`, push, every Kilo user picks up the change on their next session start.
 
-## What this is
+The tarball contains no secrets and serves only public metadata; the source code that builds it stays private.
 
-A Kilo/OpenCode plugin that you install via Bun's tarball install (`name@https://...tgz`). The plugin source lives in your private GitHub repo, Cloudflare Pages builds a tarball on every push, and the tarball is served at a public `*.pages.dev` URL. Consumers add one line to `kilo.jsonc` and the plugin handles everything: read the bundled `skills_list.json`, download each skill's files from GitHub, write them to `~/.config/kilo/skills/`, and skip unchanged skills on subsequent sessions via content-hash caching.
-
-**No static site, no Functions, no wrangler, no public source code.**
-
-## How it works
+## How a request flows
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  Private GitHub repo                                     │
-│   - src/plugin.ts (entry point)                          │
-│   - src/lib.ts (URL parsing, GitHub API)                 │
-│   - skills_list.json (you edit this)                     │
-│   - package.json (version, deps, plugin metadata)        │
+│ Private GitHub repo                                      │
+│   src/plugin.ts        Kilo plugin entry, hooks          │
+│   src/lib.ts           URL parsing, GitHub API, hashing  │
+│   skills_list.json     source of truth (you edit this)   │
+│   package.json         version + plugin metadata         │
 └──────────────────────────────────────────────────────────┘
-                         │
-                         │  git push
-                         ▼
+                          │  git push origin main
+                          ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Cloudflare Pages (connected via GitHub App)             │
-│                                                          │
-│  Build command:  npm run build                           │
-│  Output dir:     dist                                    │
-│  Result:         dist/my-skills-1.0.0.tgz                │
-│                                                          │
-│  Public URL:     https://my-skills.pages.dev/my-skills-  │
-│                  1.0.0.tgz                                │
+│ Cloudflare Pages (GitHub App connected)                   │
+│   Build command:  npm run build                          │
+│   Output dir:     dist/                                  │
+│   Produces:       dist/my-skills-X.Y.Z.tgz               │
+│   Public URL:     https://<project>.pages.dev/           │
+│                   my-skills-X.Y.Z.tgz                    │
 └──────────────────────────────────────────────────────────┘
-                         │
-                         │  Bun downloads on first install
-                         ▼
+                          │  curl -sSL on first Kilo start
+                          ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Consumer's machine                                      │
-│   kilo.jsonc:                                          │
-│     "plugin": [                                         │
-│       "my-skills@https://my-skills.pages.dev/           │
+│ Consumer's machine                                       │
+│   ~/.config/kilo/kilo.jsonc                              │
+│     "plugin": [                                          │
+│       "my-skills@https://my-skills-atd.pages.dev/        │
 │        my-skills-1.0.0.tgz"                              │
-│     ]                                                   │
+│     ]                                                    │
 │                                                          │
-│  Bun extracts tarball → bun install → loads plugin       │
+│ Bun downloads + extracts + installs deps + loads plugin  │
 └──────────────────────────────────────────────────────────┘
-                         │
-                         │  plugin runs on session.created
-                         ▼
+                          │  plugin fires on session.created
+                          ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Kilo plugin fires                                       │
+│ Plugin sync                                              │
 │   1. Read skills_list.json from plugin install dir       │
-│   2. For each entry, check content hash                  │
-│   3. If unchanged, skip                                  │
-│   4. If changed, download files from GitHub              │
-│   5. Write to ~/.config/kilo/skills/<name>/              │
-│   6. Save new hash                                       │
+│   2. For each entry:                                     │
+│        a. List files (GitHub API, or use explicit list)  │
+│        b. Fetch files                                    │
+│        c. Compute sha256 of (sorted path + content)      │
+│        d. Compare to ~/.config/kilo/.skill-state/*.hash  │
+│        e. If unchanged, skip                             │
+│        f. If changed, rm skill dir, write new files,     │
+│           write new hash                                 │
+│   3. Prune skills removed from the manifest              │
+└──────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌──────────────────────────────────────────────────────────┐
+│ Skills on disk                                           │
+│   ~/.config/kilo/skills/<name>/SKILL.md    (Kilo reads)  │
+│   ~/.config/kilo/.skill-state/<name>.hash (next-sync key)│
 └──────────────────────────────────────────────────────────┘
 ```
 
-## One-time setup
+---
 
-### 1. Create the private GitHub repo
+## 1. Configure with Kilo Code (VS Code extension)
 
-```bash
-git init my-skills
-cd my-skills
-# copy files from this draft, or use them as-is
-git add .
-git commit -m "initial"
-gh repo create my-skills --private --source=. --push
-```
+Kilo Code is the VS Code extension. It bundles the Kilo CLI binary, reads the same config files, and registers skills at session start.
 
-### 2. Connect Cloudflare Pages to the private repo
+### 1.1 Pick the right `kilo.jsonc`
 
-1. Install Cloudflare's GitHub App: https://github.com/apps/cloudflare-pages
-   - Grant access to **only the `my-skills` repo** (don't give it org-wide access)
-2. In Cloudflare dashboard: **Workers & Pages** → **Create** → **Pages** → **Connect to Git**
-3. Select your `my-skills` repo
-4. Project name: `my-skills` (this sets the `*.pages.dev` URL)
-5. **Build settings:**
+Kilo reads configs from four locations (later wins):
 
-   | Setting | Value |
-   |---|---|
-   | Framework preset | None |
-   | Build command | `npm run build` |
-   | Build output directory | `dist` |
-   | Root directory | `/` (leave default) |
-   | Node version | 22 (or default) |
+| Scope | Path |
+|---|---|
+| XDG global | `~/.config/kilo/kilo.jsonc` |
+| User home | `~/.kilo/kilo.jsonc`, `~/.kilocode/kilo.jsonc` |
+| Project root | `./kilo.jsonc`, `./.kilo/kilo.jsonc`, `./.kilocode/kilo.jsonc` |
+| Managed (enterprise) | macOS `/Library/Application Support/kilo/`, Linux `/etc/kilo/` |
 
-6. **Environment variables** (optional but recommended):
-
-   | Variable | Purpose |
-   |---|---|
-   | `GITHUB_TOKEN` | Lifts GitHub API rate limit from 60/hr to 5000/hr. Set to a GitHub PAT with no special scopes needed for public repos. Mark as **Secret**. |
-
-7. Click **Save and Deploy**. First build takes ~1 min. The tarball is now at:
-   `https://my-skills.pages.dev/my-skills-1.0.0.tgz`
-
-### 3. Verify
+For "install my personal skills in every workspace," use the global config:
 
 ```bash
-curl -I https://my-skills.pages.dev/my-skills-1.0.0.tgz
-# Should return 200, content-type: application/octet-stream (or similar)
+$EDITOR ~/.config/kilo/kilo.jsonc
 ```
 
-## Configuring the plugin in `kilo.jsonc`
+For "install skills for one project only," use a project config (less common with this plugin — most teams want global).
 
-### Basic install
-
-```jsonc
-{
-  "$schema": "https://app.kilo.ai/config.json",
-  "plugin": [
-    "my-skills@https://my-skills.pages.dev/my-skills-1.0.0.tgz"
-  ]
-}
-```
-
-When Kilo starts for the first time, Bun downloads the tarball, extracts it, runs `bun install` for the dependencies (`@kilocode/plugin`), and loads the entry point specified in the tarball's `package.json`. The plugin's hooks register and the first `session.created` event fires the sync.
-
-### Pin to a specific version
+### 1.2 Add the plugin entry
 
 ```jsonc
 {
   "plugin": [
-    "my-skills@https://my-skills.pages.dev/my-skills-1.0.0.tgz"
+    "superpowers@git+https://github.com/obra/superpowers.git",
+    "my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz"
   ]
 }
 ```
 
-Change the version number in the URL to upgrade. To force a re-download of the same version (e.g. you fixed the build but didn't bump the version), bump the version.
+Bun's tarball URL format: `name@https://host/path/to/pkg-X.Y.Z.tgz`. Bun fetches, extracts, runs `bun install` to resolve `@kilocode/plugin` from the tarball's `dependencies`, then loads the entry point declared in the tarball's `package.json` (`opencode.plugin` and `kilocode.plugin` fields point to `./src/plugin.ts`).
 
-### Pass options to the plugin
+### 1.3 Pin a version vs latest
+
+`my-skills@https://.../my-skills-1.0.0.tgz` pins to 1.0.0. To upgrade, bump the URL. To force re-download of the same version (e.g., you fixed the tarball but didn't change version), bump the version in `package.json`, push, and update the consumer URL.
+
+Bun caches by URL. Different URL = re-download. Same URL = cached.
+
+### 1.4 Pass plugin options (override defaults)
+
+Use the tuple form. The second element is an options object:
 
 ```jsonc
 {
   "plugin": [
     [
-      "my-skills@https://my-skills.pages.dev/my-skills-1.0.0.tgz",
+      "my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz",
       {
-        "skills_list_path": "~/.config/kilo/my-custom-skills.json",
-        "refresh_ms": 1800000,
-        "github_token": "ghp_override_token"
+        "refresh_ms": 1800000
       }
     ]
   ]
@@ -150,63 +123,77 @@ Change the version number in the URL to upgrade. To force a re-download of the s
 
 | Option | Default | Purpose |
 |---|---|---|
-| `skills_list_path` | bundled `skills_list.json` | Path to a custom skills list. Useful for per-project overrides. |
-| `refresh_ms` | `3600000` (1h) | How often to check for skill updates. Set to `0` to refresh every session. |
-| `disabled` | `false` | Set `true` to disable the plugin entirely (for CI, debugging). |
-| `github_token` | `GITHUB_TOKEN` env var | Override the GitHub token. Avoid putting real tokens in committed config. |
+| `refresh_ms` | `3600000` (1h) | Minimum time between syncs. Set `0` to sync every session. |
+| `disabled` | `false` | Set `true` to disable the plugin entirely (CI, debugging). |
+| `skills_list_path` | bundled `skills_list.json` | Absolute or `~/`-prefixed path to a custom skills manifest. Rarely needed — prefer editing the bundled file. |
+| `github_token` | `GITHUB_TOKEN` env var | PAT for the GitHub Contents API. Avoid committing real tokens. |
 
-### Use env vars instead of options
-
-```jsonc
-{
-  "plugin": [
-    "my-skills@https://my-skills.pages.dev/my-skills-1.0.0.tgz"
-  ]
-}
-```
-
-Then in the consumer's shell or `.env`:
-
-```bash
-export MY_SKILLS_DISABLED=0
-export MY_SKILLS_REFRESH_MS=1800000
-export MY_SKILLS_GITHUB_TOKEN=ghp_xxx
-```
+### 1.5 Env vars (alternative to options)
 
 | Env var | Equivalent option |
 |---|---|
 | `MY_SKILLS_DISABLED=1` | `{ "disabled": true }` |
 | `MY_SKILLS_REFRESH_MS=1800000` | `{ "refresh_ms": 1800000 }` |
 | `MY_SKILLS_GITHUB_TOKEN=ghp_xxx` | `{ "github_token": "ghp_xxx" }` |
-| `GITHUB_TOKEN=ghp_xxx` | `{ "github_token": "ghp_xxx" }` (used as fallback) |
+| `GITHUB_TOKEN=ghp_xxx` | `{ "github_token": "ghp_xxx" }` (fallback) |
 
-### Disable in CI
+Useful for CI:
 
 ```bash
-# In your CI environment
-MY_SKILLS_DISABLED=1 kilo run --auto "test the build"
+MY_SKILLS_DISABLED=1 kilo run "test"
 ```
 
-The plugin becomes a no-op. Useful for reproducible CI runs.
+### 1.6 Verify the plugin loaded
 
-## Configuring the source: `skills_list.json`
+After saving the config:
 
-This is the only file the plugin author edits. Lives in the repo root, gets bundled into the tarball.
+1. **Reload VS Code window**: `Cmd+Shift+P` → "Developer: Reload Window" (Kilo loads plugins once at extension startup).
+2. **Check the skill files appeared on disk**:
 
-### Simplest form
+   ```bash
+   ls ~/.config/kilo/skills/
+   # Expected: frontend-design  web-design-guidelines
+   ```
 
-```json
-[
-  "https://github.com/anthropics/skills/tree/main/skills/frontend-design",
-  "https://github.com/vercel-labs/agent-skills/tree/main/skills/web-design-guidelines"
-]
+3. **Ask the agent to list its skills**:
+
+   ```text
+   > what skills can you load?
+   ```
+
+   It should name both `frontend-design` and `web-design-guidelines`.
+
+4. **If a skill is missing**, check Kilo's stderr:
+
+   ```bash
+   kilo run "test" 2>&1 | grep -i my-skills
+   # Look for: [my-skills] [N] <name>: wrote N files
+   # Or:        [my-skills] failed to read ...
+   # Or:        [my-skills] [N] <name>: GitHub 403 ...
+   ```
+
+### 1.7 Force a re-sync from disk
+
+If the agent claims skills exist but is missing one (e.g., you just edited `skills_list.json` and need to pick it up faster than `refresh_ms`):
+
+```bash
+rm -rf ~/.config/kilo/.skill-state ~/.config/kilo/skills/*
+# Restart Kilo Code session
 ```
 
-Skill name is inferred from the last URL segment.
+The next `session.created` writes fresh skills (the hash check is bypassed because no prior hash exists).
 
-### Object form (recommended)
+---
 
-```json
+## 2. Deploy workflow: adding or bumping a skill
+
+Two scenarios: (A) adding a new skill, (B) bumping the plugin code itself. Both share the same deploy pipeline.
+
+### 2.1 Add a new skill to the manifest
+
+Edit `skills_list.json` (the ONLY file you change for content updates):
+
+```jsonc
 [
   {
     "name": "frontend-design",
@@ -214,107 +201,257 @@ Skill name is inferred from the last URL segment.
     "files": ["SKILL.md", "LICENSE.txt"]
   },
   {
-    "name": "impeccable",
-    "url": "https://github.com/pbakaus/impeccable/tree/main",
-    "ref": "v1.2.0"
+    "name": "web-design-guidelines",
+    "url": "https://github.com/vercel-labs/agent-skills/tree/main/skills/web-design-guidelines",
+    "files": ["SKILL.md"]
   }
 ]
 ```
 
-| Field | Required | Purpose |
-|---|---|---|
-| `name` | no (inferred) | Folder name under `~/.config/kilo/skills/` |
-| `url` | yes | Source URL — GitHub tree, raw URL, GitLab, or any HTTPS with a `SKILL.md` |
-| `ref` | no (default `main`) | Git branch/tag/SHA to pin |
-| `files` | no | Explicit file list. Skips GitHub API discovery. **Use this to avoid 403s on unauthenticated IPs.** |
-| `include_glob` | no | Glob filter (e.g. `references/*.md`) |
-| `exclude` | no | Glob patterns to skip (e.g. `["*.bak"]`) |
-| `expand` | no | If `true`, treat the URL as a directory of multiple skills |
+Validate the JSON, then commit:
 
-### Use explicit `files` to avoid rate limits
-
-If you're building on a CI server or shared IP, GitHub may 403 unauthenticated requests. Listing files explicitly bypasses the API:
-
-```json
-{
-  "name": "my-skill",
-  "url": "https://github.com/owner/repo/tree/main/skills/my-skill",
-  "files": ["SKILL.md", "references/x.md", "assets/y.md"]
-}
+```bash
+jq . skills_list.json  # validates
+git diff skills_list.json
+git add skills_list.json
+git commit -m "feat: add new-skill to manifest"
+git push origin main
 ```
 
-You lose auto-discovery but gain reliability. Use the `GITHUB_TOKEN` env var in CF Pages for the auto-discover form to work on shared IPs.
+CF Pages detects the push, runs `npm run build`, deploys the new tarball. Consumers pick it up on their next session start (no action from them).
 
-## Build configuration
+### 2.2 Bump the plugin version (required when changing plugin code or skills_list.json)
 
-The `package.json` has a `build` script that does the only thing needed:
+Bumping is how consumers force re-download. Bun caches by URL — without a bump, existing installations won't fetch the new tarball.
 
-```json
-{
-  "scripts": {
-    "build": "npm run clean && npm run pack",
-    "pack": "mkdir -p dist && npm pack --pack-destination dist",
-    "clean": "rm -rf dist"
-  }
-}
+```bash
+cd my-skills
+
+# Optional: edit src/plugin.ts or src/lib.ts first
+npm version patch   # 1.0.0 → 1.0.1
+# or: npm version minor, npm version major
+
+git push origin main
 ```
 
-`npm pack` produces a tarball with the layout Bun expects:
+CF Pages rebuilds with the new version. The new tarball URL becomes `https://my-skills-atd.pages.dev/my-skills-1.0.1.tgz`. Tell consumers (your team) to update their `kilo.jsonc`:
+
+```diff
+-"my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz"
++"my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.1.tgz"
+```
+
+### 2.3 End-to-end deploy (full sequence)
+
+```bash
+# 1. Edit
+vim skills_list.json   # or src/*.ts
+
+# 2. Local build to verify
+npm install
+npm run build
+ls -lah dist/
+tar -tzf dist/my-skills-*.tgz   # must show package/src/*.ts + package/skills_list.json
+
+# 3. Bump version (only if you're happy with the build)
+npm version patch
+
+# 4. Push (triggers CF Pages)
+git add -A
+git commit -m "feat: ..."
+git push origin main
+
+# 5. Wait ~30-90s for CF Pages
+sleep 60
+
+# 6. Verify the deploy
+wrangler pages deployment list --project-name my-skills | head -5
+curl -sSL -o /tmp/check.tgz https://my-skills-atd.pages.dev/my-skills-$(jq -r .version package.json).tgz
+shasum -a 256 /tmp/check.tgz
+tar -tzf /tmp/check.tgz   # contents should match your local build
+
+# 7. Tell consumers to update kilo.jsonc (or rely on automatic pickup if URL didn't change)
+```
+
+### 2.4 Roll back
+
+```bash
+git revert HEAD
+git push origin main
+# Wait for CF Pages rebuild
+# Consumers see the reverted version at the URL they have pinned
+```
+
+If a bad version is already live, you can also re-deploy an older tarball directly:
+
+```bash
+wrangler pages deploy dist/my-skills-1.0.0.tgz --project-name my-skills
+```
+
+---
+
+## 3. Technical reference
+
+### 3.1 Architecture summary
+
+- **Source of truth**: GitHub repo (private). `skills_list.json` is the manifest of skills to ship. `src/plugin.ts` is the runtime.
+- **Distribution**: Cloudflare Pages builds the tarball from `npm run build` output (`dist/`). Tarball URL is public but contains no secrets.
+- **Runtime**: Kilo (CLI or VS Code extension) downloads the tarball via Bun, installs dependencies, loads the plugin. Plugin reads its own bundled `skills_list.json`, fetches skill files from public GitHub repos, writes them to `~/.config/kilo/skills/<name>/`.
+
+### 3.2 File layout
+
+```
+my-skills/
+├── package.json          version, plugin metadata, build scripts
+├── package-lock.json     npm lockfile (commit this)
+├── tsconfig.json         IDE support for src/*.ts
+├── skills_list.json      the only file you edit for content changes
+├── README.md             this file
+├── .gitignore            node_modules, dist, ._, .env
+├── src/
+│   ├── plugin.ts         entry point, exports MySkills function
+│   └── lib.ts            URL parsing, GitHub Contents API, hashing
+├── .kilo/                Kilo CLI project state (auto-managed)
+└── dist/                 build output (gitignored)
+    └── my-skills-X.Y.Z.tgz
+```
+
+### 3.3 `package.json` fields that matter
+
+| Field | Purpose |
+|---|---|
+| `name` | Must match the folder name Bun extracts to (`my-skills`). Used by `resolvePluginRoot()` to find the package root. |
+| `version` | Bump to force consumer re-download. Appears in the tarball filename. |
+| `main` | Points to `./src/plugin.ts`. Bun loads this. |
+| `exports["."]` | Same as `main`. Required for Bun's tarball URL format. |
+| `opencode.plugin` | OpenCode-specific entry pointer. Same as `main`. |
+| `kilocode.plugin` | Kilo-specific entry pointer. Same as `main`. |
+| `files` | Whitelist of what `npm pack` includes. Default includes nothing useful — must list `src`, `skills_list.json`, `README.md`. |
+| `scripts.build` | `npm run clean && npm pack --pack-destination dist`. Runs on CF Pages. |
+| `dependencies` | `{ "@kilocode/plugin": "latest" }`. Bun installs this from npm at consumer install time. |
+| `engines.bun` | `>=1.3.0`. Kilo uses Bun to install the tarball. |
+| `engines.node` | `>=22.0.0`. CF Pages build runs on Node. |
+
+### 3.4 Tarball layout (what Bun extracts)
 
 ```
 my-skills-1.0.0.tgz
 └── package/
-    ├── package.json     # has opencode.plugin + kilocode.plugin fields
-    ├── skills_list.json # the user-edited file
+    ├── package.json
+    ├── skills_list.json
+    ├── README.md
     └── src/
-        ├── plugin.ts    # main entry
-        └── lib.ts       # helpers
+        ├── plugin.ts
+        └── lib.ts
 ```
 
-The `files` array in `package.json` controls what gets included:
+`npm pack` always wraps files in a `package/` directory. Bun extracts that and runs `bun install` to resolve deps.
 
-```json
-{
-  "files": ["src", "skills_list.json", "README.md"]
+### 3.5 Plugin lifecycle (when hooks fire)
+
+| Hook | Fires when | Plugin action |
+|---|---|---|
+| `session.created` | New Kilo session starts | Sync (debounced by `refresh_ms`) |
+| `session.idle` | Session goes idle | Sync (debounced) — catches long sessions |
+
+Both call the same `run()` function. The first call after install always syncs. Subsequent calls within `refresh_ms` are no-ops. The sync does:
+
+1. Compute `manifestHash` from `JSON.stringify(entries)`. If unchanged from last sync, return immediately (manifest-level dedup).
+2. For each entry:
+   - `listGitHubDir(entry)` — calls GitHub Contents API, returns all files under the skill's directory.
+   - If GitHub returns 403 and entry has explicit `files`, use those instead (no API call).
+   - `filterFiles()` — apply `include_glob` / `exclude`.
+   - Fetch all files in parallel via `fetch()` on `download_url`.
+   - `contentHash()` — SHA-256 over sorted `(path, content)` pairs.
+   - Compare to `~/.config/kilo/.skill-state/<name>.hash`. If equal, skip.
+   - If different, `rmSync(targetDir)`, mkdir, write each file, save new hash.
+3. Prune skills that were removed from the manifest (compare `lastEntryNames` set).
+
+### 3.6 `skills_list.json` schema
+
+Array of entries, each either a string (URL) or an object:
+
+```ts
+interface SkillEntry {
+  name?: string                    // inferred from URL if absent
+  url: string                      // GitHub tree URL or raw.githubusercontent.com URL
+  ref?: string | null              // branch/tag/SHA, default "main"
+  files?: string[]                 // explicit file list (skips GitHub API)
+  include_glob?: string            // e.g. "references/*.md"
+  exclude?: string[]               // e.g. ["*.bak"]
+  expand?: boolean                 // (reserved, currently unused)
 }
 ```
 
-Only files matching these patterns go into the tarball. The `dist/` folder, `node_modules/`, `.git/`, etc. are excluded.
+**URL formats accepted**:
 
-### Local build (for testing)
+| Host | URL pattern |
+|---|---|
+| github.com | `https://github.com/{owner}/{repo}/tree/{ref}/{path}` |
+| raw.githubusercontent.com | `https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}/SKILL.md` |
+| (others) | rejected — `parseGitHub` returns null |
 
-```bash
-cd my-skills
-npm install
-npm run build
-ls -lah dist/
-# Should show: my-skills-1.0.0.tgz
+**Path-stripping logic**: GitHub Contents API returns `item.path` as the full repo-relative path (e.g. `skills/frontend-design/SKILL.md`). The plugin strips `<parsed.path>/` prefix to make paths relative to the skill dir (`SKILL.md`). This is what makes the on-disk layout match Kilo's discovery rule.
 
-# Verify the tarball structure
-tar -tzf dist/my-skills-1.0.0.tgz
-# Should show: package/package.json, package/skills_list.json, package/src/*.ts
+### 3.7 Content-hash details
+
+```
+hash = SHA-256(join(sorted_keys(filenames), concat(path_i + content_i)))
 ```
 
-### Bump the version
+- Sort keys alphabetically → same files in any order give the same hash.
+- Whitespace change → different hash (the entire file content is part of the digest).
+- Adding an unrelated file to the source directory → different hash → re-download.
 
-Before pushing a change to `skills_list.json` or the plugin code:
+To avoid unnecessary re-downloads when the source repo grows, use the explicit `files` array to pin what you want.
 
-```bash
-# Edit files...
-npm version patch   # 1.0.0 → 1.0.1
-# or: npm version minor  # 1.0.0 → 1.1.0
-git add .
-git commit -m "bump to 1.0.1"
-git push
+### 3.8 PLUGIN_ROOT resolution
+
+```ts
+function resolvePluginRoot(start: string): string {
+  let dir = start
+  for (let i = 0; i < 8; i++) {
+    const pkg = join(dir, "package.json")
+    const list = join(dir, "skills_list.json")
+    if (existsSync(pkg) && existsSync(list)) {
+      try {
+        const name = JSON.parse(readFileSync(pkg, "utf-8")).name
+        if (name === "my-skills") return dir
+      } catch {}
+    }
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return join(start, "..", "..") // dev fallback
+}
 ```
 
-CF Pages rebuilds. The new tarball appears at `https://my-skills.pages.dev/my-skills-1.0.1.tgz`. Update the URL in consumer `kilo.jsonc` files.
+Walks up from `__dirname` looking for the directory containing both `package.json` (with `name: "my-skills"`) and `skills_list.json`. Works for both layouts:
+- Consumer-installed: `~/.cache/kilo/packages/my-skills@.../node_modules/my-skills/` → walks up 1 level (1: to node_modules, 2: wrong... wait it actually matches at `node_modules/my-skills/` directly because both files are there).
+- Dev mode (`bun run src/plugin.ts` from repo root): walks up from `src/` to repo root, matches `package.json` + `skills_list.json` at repo root.
 
-**Why bump on every change:** Bun caches by URL. If you don't bump, consumers won't pick up the new tarball unless they manually clear `~/.bun/install/cache/`. Bumping the version forces a fresh download.
+### 3.9 Cache layout
 
-## Cloudflare Pages configuration reference
+```
+~/.cache/kilo/packages/
+├── my-skills@https:/<host>/<path>/my-skills-1.0.0.tgz/
+│   ├── my-skills-1.0.0.tgz       # downloaded tarball (may be extracted in place)
+│   └── node_modules/             # after bun add resolves deps
+│       ├── my-skills/            # the plugin package
+│       │   ├── package.json
+│       │   ├── skills_list.json
+│       │   └── src/
+│       │       ├── plugin.ts
+│       │       └── lib.ts
+│       └── @kilocode/plugin/     # installed dependency
+├── superpowers@git+https:/github.com/obra/superpowers.git/
+└── ...
+```
 
-### Build settings
+The cache key includes the URL (`my-skills@https:` + URL with `:` and `/` becoming filesystem path components).
+
+### 3.10 Cloudflare Pages config
 
 | Setting | Value |
 |---|---|
@@ -322,187 +459,178 @@ CF Pages rebuilds. The new tarball appears at `https://my-skills.pages.dev/my-sk
 | Build output directory | `dist` |
 | Root directory | `/` |
 | Node version | 22 |
-| Enable build caching | ✅ |
+| Build caching | enabled |
 
-### Environment variables
+**Required**: Cloudflare GitHub App installed on the repo. CF Pages → Create → Pages → Connect to Git → select this repo → configure build → Save and Deploy.
+
+**Environment variables** (set in Pages dashboard):
 
 | Name | Type | Required | Purpose |
 |---|---|---|---|
-| `GITHUB_TOKEN` | Secret | recommended | GitHub PAT. Lifts rate limit 60/hr → 5000/hr. No scopes needed for public repos. |
+| `GITHUB_TOKEN` | Secret | recommended for shared CI IPs | Lifts rate limit 60/hr → 5000/hr. No scopes needed for public repos. Used by the plugin at consumer runtime, NOT at build time. |
 
-### Custom domain
+**Branch previews**: every branch gets a preview URL automatically. Format: `https://<commit-hash>.my-skills-atd.pages.dev/my-skills-1.0.0.tgz`. Useful for testing before merging.
 
-In Pages dashboard: **Custom domains** → **Set up a custom domain** → enter e.g. `skills.example.com`. Cloudflare auto-provisions SSL. Update consumer URLs accordingly.
+**Custom domain**: Pages → Custom domains → enter `skills.example.com`. Cloudflare auto-provisions SSL. Update consumer URLs accordingly.
 
-### Branch previews
+### 3.11 Security model
 
-CF Pages automatically creates preview deployments for non-`main` branches. Useful for testing before merging:
+- **Source repo is private.** Only people you grant access can see the build config, `skills_list.json`, plugin code.
+- **CF Pages deployment is public.** The tarball is served over HTTPS to anyone who knows the URL.
+- **The tarball contains no secrets.** It only has `skills_list.json` (public URLs), `src/*.ts` (plugin code that points at public GitHub), and a README.
+- **`GITHUB_TOKEN` is per-consumer.** Not baked into the tarball. Each consumer sets their own (or the plugin uses anonymous rate-limited requests).
+- **GitHub rate limits**: 60 req/hr unauthenticated per IP. On shared IPs (CI, corporate NAT), you'll 403 fast. Each consumer should set `GITHUB_TOKEN` themselves.
 
-- `https://abc123.my-skills.pages.dev/my-skills-1.0.0.tgz` (preview branch)
-- `https://main.my-skills.pages.dev/my-skills-1.0.0.tgz` (main branch)
+### 3.12 Troubleshooting
 
-Consumers can test against a preview URL before you merge to main.
-
-### Access policies (for the tarball)
-
-If you want the tarball itself gated (not just the source repo), use Cloudflare Access:
-
-1. Zero Trust dashboard → **Access** → **Applications** → **Add** → **Self-hosted**
-2. Application domain: `my-skills.pages.dev`
-3. Policy: require email match (your team) or service auth
-4. Save
-
-Consumers then need a CF Access service token in their requests. To make this work with Bun's tarball install, you'd need to either:
-- Bake the token into the URL: `name@https://CF_Access_ClientId:CF_Access_Client_Secret@my-skills.pages.dev/...` (awkward, leaks creds)
-- Or skip CF Pages for the plugin and use Path B (private GitHub + auth)
-
-For most teams, the private source repo is sufficient access control. The CF Pages deployment is intentionally public because the tarball contains no secrets (just skill metadata and code that points at public GitHub repos).
-
-## Plugin behavior reference
-
-### What fires when
-
-| Event | What happens |
-|---|---|
-| First Kilo session after install | Plugin loads, manifest is unknown, sync runs immediately |
-| Subsequent sessions within `refresh_ms` | Plugin loads, last refresh is recent, no-op |
-| Session after `refresh_ms` elapsed | Plugin loads, debounce expires, sync runs |
-| `session.created` | Sync runs (debounced) |
-| `session.idle` | Sync runs (debounced) — catches long-running sessions |
-| Skill source updates on GitHub | Next sync detects hash change, re-downloads, re-extracts |
-| Skill removed from `skills_list.json` | Next sync removes the local folder and state file |
-
-### What gets written to disk
-
-```
-~/.config/kilo/skills/<name>/
-  SKILL.md
-  references/...
-  assets/...
-  ...
-
-~/.config/kilo/.skill-state/<name>.hash
-  # 64-char sha256 of the sorted (path, content) pairs
-```
-
-### Content-hash details
-
-The hash is computed over:
-- All file paths in sorted order (joined with the file contents)
-- SHA-256
-
-Same files in different order → same hash. Same files but with a whitespace change → different hash. This means GitHub adding an unrelated file to a directory changes the hash and triggers a re-download.
-
-To avoid that for skill sources you don't control, use the explicit `files` array to pin what you want.
-
-## Troubleshooting
-
-### Plugin doesn't load
-
-Check that the tarball URL is reachable and the package.json has the right fields:
+**Plugin doesn't load at all**
 
 ```bash
-# Verify tarball is downloadable
-curl -I https://my-skills.pages.dev/my-skills-1.0.0.tgz
-
-# Check Kilo's stderr for plugin load errors
-kilo run --print-logs "test" 2>&1 | grep -i "my-skills"
+curl -sI https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz  # expect 200
+file <(curl -sSL https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz)  # expect gzip
+tar -tzf <(curl -sSL ...)  # expect package/src/*.ts etc.
+kilo run "test" 2>&1 | grep -i my-skills  # look for "loading plugin" + any errors
 ```
 
-### Skills not appearing
+**Skills don't appear after install**
 
 ```bash
-# Check the manifest was read
-ls ~/.config/kilo/skills/   # should list your skills
-
-# Check the state file
-ls ~/.config/kilo/.skill-state/   # should have <name>.hash files
-
-# Force a re-sync
+ls ~/.config/kilo/skills/        # should list skills
+ls ~/.config/kilo/.skill-state/  # should have <name>.hash files
+# Force re-sync by clearing state
 rm -rf ~/.config/kilo/.skill-state
-kilo run --print-logs "test" 2>&1 | grep my-skills
+# Restart Kilo Code session (Cmd+Shift+P → Reload Window)
 ```
 
-### GitHub 403 in plugin output
+**Agent says "no skills loaded"**
 
-The plugin can't reach GitHub from the consumer's machine, or the rate limit is hit. Options:
-- Set `GITHUB_TOKEN` in the consumer's env (or pass it via the plugin options)
-- Switch the `skills_list.json` entry to use an explicit `files` array (no API call needed)
+The skill list is loaded at session start. Plugins loaded later (e.g., after config changes) require a session restart.
 
-### "Bad path" warnings in plugin output
+**GitHub 403 in plugin output**
 
-Path traversal defense. A skill source has a file with `..` or absolute path. Add to `exclude`:
+```bash
+# Either set a token:
+export GITHUB_TOKEN=ghp_xxx
+# Or use explicit files in skills_list.json (no API call needed):
+{ "name": "...", "url": "...", "files": ["SKILL.md"] }
+```
 
-```json
-{
-  "exclude": ["../**", "**/.*", "**/*.bak"]
+**Tarball not updating on CF Pages**
+
+```bash
+wrangler pages deployment list --project-name my-skills
+# Check the latest deployment status — should be "Active"
+# If failed, check the Build link in dashboard for npm errors
+```
+
+Common CF Pages build failures:
+- `npm install` fails → check Node version (22+)
+- `npm pack` produces 0 files → `files` field in package.json missing or wrong
+- Build succeeds but `dist/` empty → check `npm pack --pack-destination` flag works (npm 9+)
+
+**Consumers see old version**
+
+Bun caches by URL. Bump the version in `package.json`, push, update consumer URLs. Or have the consumer run `rm -rf ~/.bun/install/cache/`.
+
+**Plugin fires but doesn't write skills**
+
+Check `~/.config/kilo/skills/` permissions. Kilo runs as your user, so this should be fine, but if you ran Kilo as another user, the dir might be owned by them.
+
+**Plugin reads wrong `skills_list.json`**
+
+If you used the `skills_list_path` option, it overrides the bundled file. Clear it from your `kilo.jsonc` to use the bundled default.
+
+**Test the plugin without restarting Kilo Code**
+
+You can fire the plugin's hooks in a Bun REPL:
+
+```bash
+~/.bun/bin/bun -e '
+const path = "/Users/<you>/.cache/kilo/packages/my-skills@https:/my-skills-atd.pages.dev/my-skills-1.0.0.tgz/node_modules/my-skills/src/plugin.ts"
+const { MySkills } = await import(path)
+const hooks = await MySkills({}, {})
+await hooks["session.created"]({})
+'
+```
+
+This is exactly what Kilo does internally.
+
+### 3.13 File reference
+
+**`src/plugin.ts`** (entry point):
+
+```ts
+export const MySkills: Plugin = async (_ctx, options = {}) => {
+  const skillsListPath = options.skills_list_path ?? SKILLS_LIST_PATH
+  const refreshMs      = options.refresh_ms ?? REFRESH_INTERVAL_MS
+  const disabled       = options.disabled ?? DISABLED
+  const token          = options.github_token ?? GITHUB_TOKEN
+
+  let lastRun = 0
+  async function run() {
+    if (disabled) return
+    if (Date.now() - lastRun < refreshMs) return
+    lastRun = Date.now()
+    const entries = parse(skillsListPath)
+    await sync(entries)
+  }
+
+  return {
+    "session.created": () => { void run() },
+    "session.idle":    () => { void run() },
+  }
 }
 ```
 
-### Tarball not updating on CF Pages
+**`src/lib.ts`** helpers:
 
-Check the build log in Pages dashboard. Common issues:
-- `npm install` fails → check Node version (needs 22+)
-- `npm pack` produces 0 files → check `files` array in `package.json`
-- Build succeeds but `dist/` is empty → check `--pack-destination` flag works in your npm version
+| Function | Purpose |
+|---|---|
+| `parseGitHub(url)` | Extract `{owner, repo, ref, path}` from a GitHub URL |
+| `deriveName(url)` | Infer skill name from URL's last path segment |
+| `listGitHubDir(entry, token)` | Recursively list files via GitHub Contents API, with explicit-files fallback |
+| `filterFiles(files, entry)` | Apply `include_glob` / `exclude` filters |
+| `isSafePath(p)` | Reject `..`, absolute paths, null bytes |
+| `contentHash(files)` | SHA-256 over sorted `(path, content)` pairs |
+| `matchGlob(p, pattern)` | `*` → `[^/]*`, `**` → `.*` |
 
-### Version not bumping / consumers seeing old version
+### 3.14 CI / pre-commit checks (recommended)
 
-Bun caches tarball downloads. To force refresh on a consumer:
 ```bash
-rm -rf ~/.bun/install/cache/
+# Validate JSON
+jq . skills_list.json > /dev/null
+
+# Verify the tarball builds and has the right shape
+npm install
+rm -rf dist
+npm run build
+test -f dist/my-skills-$(jq -r .version package.json).tgz
+tar -tzf dist/my-skills-*.tgz | grep -q 'package/src/plugin.ts'
+tar -tzf dist/my-skills-*.tgz | grep -q 'package/skills_list.json'
+
+# Verify TS compiles
+npx tsc --noEmit
 ```
 
-Or bump the version in `package.json` so the URL changes.
+### 3.15 Migration from older setups
 
-## Migration from previous versions
+**From public `git+https://` install**:
 
-### From the static-`dist/` version
-
-1. Delete `dist/`, `build.ts`, `_headers`, `wrangler.toml` (no longer needed)
-2. Add the `package.json` fields: `main`, `opencode`, `kilocode`, `files`, `scripts.build`
-3. Move `src/plugin.ts` to the new layout
-4. CF Pages build command: `npm run build` (was `bun run build`)
-5. Consumer install format: `name@https://pages.dev/my-skills-1.0.0.tgz` (was direct file URLs)
-
-### From public GitHub + `git+https://` install
-
-1. Set the GitHub repo to private
-2. Install Cloudflare GitHub App on the repo
-3. Connect CF Pages (build command: `npm run build`)
-4. Update consumer `kilo.jsonc` from:
-   ```jsonc
-   "my-skills@git+https://github.com/USER/REPO.git"
-   ```
-   to:
-   ```jsonc
-   "my-skills@https://my-skills.pages.dev/my-skills-1.0.0.tgz"
-   ```
-
-## File layout
-
-```
-my-skills/
-├── package.json              # version, plugin metadata, build scripts
-├── tsconfig.json             # IDE support for src/*.ts
-├── skills_list.json          # ← only file you edit
-├── README.md                 # this file
-├── .gitignore
-├── src/
-│   ├── plugin.ts             # main entry, Kilo/OpenCode plugin
-│   └── lib.ts                # helpers: URL parsing, GitHub API, hashing
-└── dist/                     # build output (gitignored)
-    └── my-skills-X.Y.Z.tgz   # produced by `npm run build`
+```diff
+-"my-skills@git+https://github.com/USER/REPO.git"
++"my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz"
 ```
 
-## Maintainer handoff notes
+**From static-`dist/` Pages deploy** (legacy version where `dist/` was the Pages output): delete `wrangler.toml`, `_headers`; add the `package.json` plugin fields (`opencode.plugin`, `kilocode.plugin`, `exports`, `main`, `files`, `scripts.build`); change CF Pages build command to `npm run build`.
 
-- **`skills_list.json` is the only file you edit for content changes.** Bump `package.json` version on every change.
-- **CF Pages is the build target.** It rebuilds on every push to main. No GitHub Actions needed.
-- **Bun's tarball install format** is what makes this work. The tarball is just an npm package; Bun handles the rest.
-- **The plugin reads its own bundled `skills_list.json`** at runtime. Consumer overrides via `skills_list_path` option are supported but rarely needed.
-- **No secrets in the tarball.** `GITHUB_TOKEN` is set at build time (in CF Pages env), not embedded. Consumers set their own.
-- **Versioning is manual but trivial.** Run `npm version patch/minor/major`, commit, push. CF Pages handles the rest.
+### 3.16 Maintainer checklist
+
+- [ ] `skills_list.json` is the only file for content changes.
+- [ ] Bump `package.json` version on every change (forces re-download).
+- [ ] Local `npm run build` produces a tarball that matches what CF Pages deploys (verify via SHA256).
+- [ ] CF Pages deploy is `Active` after push (`wrangler pages deployment list`).
+- [ ] `GITHUB_TOKEN` is set in CF Pages env (recommended) and optionally in consumer env.
+- [ ] `kilo.jsonc` URL is updated when version bumps (unless you want consumers to follow `latest`).
 
 ## License
 

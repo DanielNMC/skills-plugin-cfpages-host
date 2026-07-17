@@ -7,6 +7,6 @@
   {
     "name": "web-design-guidelines",
     "url": "https://github.com/vercel-labs/agent-skills/tree/main/skills/web-design-guidelines",
-    "files": ["SKILL.md", "metadata.json"]
+    "files": ["SKILL.md"]
   }
 ]

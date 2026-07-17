@@ -74,7 +74,9 @@ export async function listGitHubDir(
   if (!parsed) throw new Error(`Unparseable URL: ${entry.url}`)
 
   const files: ResolvedFile[] = []
-  const stack = [parsed.path]
+  const basePath = parsed.path.trim().replace(/\/+$/, "")
+  const basePrefix = basePath ? `${basePath}/` : ""
+  const stack = [basePath]
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "User-Agent": "my-skills-plugin",
@@ -99,8 +101,12 @@ export async function listGitHubDir(
     if (!Array.isArray(items)) continue
     for (const item of items) {
       if (item.type === "file") {
+        const relativePath =
+          basePrefix && item.path.startsWith(basePrefix)
+            ? item.path.slice(basePrefix.length)
+            : item.path
         files.push({
-          path: item.path,
+          path: relativePath,
           raw_url: item.download_url,
           size: item.size,
         })

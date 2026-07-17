@@ -22,10 +22,27 @@ import {
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
-// Resolved at install time:
-//   ~/.cache/opencode/packages/my-skills-1.0.0/package/src/plugin.ts
-// So PLUGIN_ROOT is two levels up: ~/.cache/opencode/packages/my-skills-1.0.0/
-const PLUGIN_ROOT = join(__dirname, "..", "..")
+function resolvePluginRoot(start: string): string {
+  let dir = start
+  for (let i = 0; i < 8; i++) {
+    const pkg = join(dir, "package.json")
+    const list = join(dir, "skills_list.json")
+    if (existsSync(pkg) && existsSync(list)) {
+      try {
+        const name = JSON.parse(readFileSync(pkg, "utf-8")).name
+        if (name === "my-skills") return dir
+      } catch {
+        /* unreadable package.json, keep walking */
+      }
+    }
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return join(start, "..", "..")
+}
+
+const PLUGIN_ROOT = resolvePluginRoot(__dirname)
 const SKILLS_LIST_PATH = join(PLUGIN_ROOT, "skills_list.json")
 
 // ---- Config (env vars + plugin options) ----

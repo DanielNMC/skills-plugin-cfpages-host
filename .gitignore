@@ -5,3 +5,6 @@ dist/
 .env
 .env.local
 *.log
+
+# Wrangler local state
+.wrangler/

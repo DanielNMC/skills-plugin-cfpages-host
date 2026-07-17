@@ -247,6 +247,7 @@ CF Pages rebuilds with the new version. The new tarball URL becomes `https://my-
 # 1. Edit
 vim skills_list.json   # or src/*.ts
 
+
 # 2. Local build to verify
 npm install
 npm run build

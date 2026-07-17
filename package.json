@@ -1,0 +1,15 @@
+{
+  "name": "my-skills",
+  "private": true,
+  "type": "module",
+  "description": "Static skills registry for AI coding agents. Builds a pure-static dist/ folder deployable anywhere.",
+  "scripts": {
+    "build": "bun run build.ts",
+    "build:token": "GITHUB_TOKEN=ghp_xxx bun run build.ts",
+    "serve": "cd dist && python3 -m http.server 8000",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2"
+  }
+}

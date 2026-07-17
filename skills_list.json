@@ -1,0 +1,12 @@
+[
+  {
+    "name": "frontend-design",
+    "url": "https://github.com/anthropics/skills/tree/main/skills/frontend-design",
+    "files": ["SKILL.md", "LICENSE.txt"]
+  },
+  {
+    "name": "web-design-guidelines",
+    "url": "https://github.com/vercel-labs/agent-skills/tree/main/skills/web-design-guidelines",
+    "files": ["SKILL.md", "metadata.json"]
+  }
+]

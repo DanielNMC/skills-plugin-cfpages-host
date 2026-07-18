@@ -1,0 +1,7 @@
+{
+  "skills": [
+    { "name": "frontend-design", "files": ["SKILL.md", "LICENSE.txt"] },
+    { "name": "web-design-guidelines", "files": ["SKILL.md"] },
+    { "name": "animation-vocabulary", "files": ["SKILL.md"] }
+  ]
+}

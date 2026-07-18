@@ -15,12 +15,14 @@
   },
   "files": [
     "src",
-    "skills_list.json",
+    "skills",
+    "skills.json",
     "README.md"
   ],
   "scripts": {
-    "build": "npm run clean && npm run pack",
+    "build": "npm run clean && npm run pack && npm run copy-skills",
     "pack": "mkdir -p dist && npm pack --pack-destination dist",
+    "copy-skills": "mkdir -p dist/skills && cp -R skills/. dist/skills/ && cp skills.json dist/skills.json",
     "clean": "rm -rf dist",
     "dev": "bun run src/plugin.ts"
   },

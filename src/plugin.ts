@@ -1,214 +1,150 @@
-// src/plugin.ts
-// my-skills — Kilo/OpenCode plugin entry point.
-// Loaded by Bun after the tarball is installed. Runs on session.created.
-
-import type { Plugin } from "@kilocode/plugin"
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs"
-import { join, dirname } from "node:path"
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { join } from "node:path"
 import { homedir } from "node:os"
-import { fileURLToPath } from "node:url"
 
 import {
-  parseGitHub,
-  deriveName,
-  listGitHubDir,
-  filterFiles,
-  isSafePath,
+  SKILLS_BASE,
   contentHash,
+  isSafePath,
+  readManifest,
   type SkillEntry,
-  type ResolvedFile,
-} from "./lib.ts"
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
-
-function resolvePluginRoot(start: string): string {
-  let dir = start
-  for (let i = 0; i < 8; i++) {
-    const pkg = join(dir, "package.json")
-    const list = join(dir, "skills_list.json")
-    if (existsSync(pkg) && existsSync(list)) {
-      try {
-        const name = JSON.parse(readFileSync(pkg, "utf-8")).name
-        if (name === "my-skills") return dir
-      } catch {
-        /* unreadable package.json, keep walking */
-      }
-    }
-    const parent = dirname(dir)
-    if (parent === dir) break
-    dir = parent
-  }
-  return join(start, "..", "..")
-}
-
-const PLUGIN_ROOT = resolvePluginRoot(__dirname)
-const SKILLS_LIST_PATH = join(PLUGIN_ROOT, "skills_list.json")
-
-// ---- Config (env vars + plugin options) ----
-
-const REFRESH_INTERVAL_MS = Number(
-  process.env.MY_SKILLS_REFRESH_MS ?? 60 * 60 * 1000,
-)
-const DISABLED = process.env.MY_SKILLS_DISABLED === "1"
-const GITHUB_TOKEN =
-  process.env.GITHUB_TOKEN || process.env.MY_SKILLS_GITHUB_TOKEN
-
-// Consumer can override these by passing options to the plugin in kilo.jsonc:
-//   ["my-skills@https://...", { "skills_list_path": "/custom/path.json" }]
-interface PluginOptions {
-  skills_list_path?: string
-  refresh_ms?: number
-  disabled?: boolean
-  github_token?: string
-}
+} from "./lib"
 
 const SKILLS_ROOT = join(homedir(), ".config", "kilo", "skills")
 const STATE_ROOT = join(homedir(), ".config", "kilo", ".skill-state")
+const DEFAULT_REFRESH_MS = 60 * 60 * 1000
 
-let lastRefresh = 0
-let lastManifestHash: string | null = null
-let lastEntryNames: Set<string> = new Set()
+interface PluginOptions {
+  refresh_ms?: number
+  disabled?: boolean
+}
 
-// ---- Core sync logic ----
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 
 async function syncSkill(
   entry: SkillEntry,
   index: number,
-): Promise<{ name: string; files: number; hash: string } | null> {
-  const name = entry.name ?? deriveName(entry.url)
-
-  // Discover files
-  let allFiles: ResolvedFile[]
-  try {
-    allFiles = await listGitHubDir(entry, GITHUB_TOKEN)
-  } catch (e: any) {
-    console.warn(`[my-skills] [${index}] ${name}: ${e.message}`)
-    return null
+): Promise<void> {
+  const name = typeof entry?.name === "string" ? entry.name : ""
+  if (
+    !isSafePath(name) ||
+    !Array.isArray(entry?.files) ||
+    entry.files.some(
+      (file) => typeof file !== "string" || !isSafePath(file),
+    )
+  ) {
+    console.warn(`[my-skills] [${index}] ${name}: bad path`)
+    return
   }
 
-  const files = filterFiles(allFiles, entry)
-  if (!files.length) {
-    console.warn(`[my-skills] [${index}] ${name}: no files matched filters`)
-    return null
-  }
-
-  // Fetch all in parallel
   const fetched = new Map<string, Uint8Array>()
-  await Promise.all(
-    files.map(async (f) => {
-      try {
-        const r = await fetch(f.raw_url, {
-          headers: { "User-Agent": "my-skills-plugin" },
-        })
-        if (r.ok) {
-          fetched.set(f.path, new Uint8Array(await r.arrayBuffer()))
-        }
-      } catch {
-        /* skip individual file failures */
+  for (const file of entry.files) {
+    try {
+      const response = await fetch(
+        `${SKILLS_BASE}/skills/${encodeURIComponent(name)}/${encodeURIComponent(file)}`,
+        { cache: "no-store" },
+      )
+      if (!response.ok) {
+        console.warn(
+          `[my-skills] [${index}] ${name}: ${file} fetch failed: ${response.status}`,
+        )
+        continue
       }
-    }),
-  )
-
-  if (fetched.size === 0) {
-    console.warn(`[my-skills] [${index}] ${name}: all file fetches failed`)
-    return null
+      fetched.set(file, new Uint8Array(await response.arrayBuffer()))
+    } catch (error) {
+      console.warn(
+        `[my-skills] [${index}] ${name}: ${file} fetch failed: ${errorMessage(error)}`,
+      )
+    }
   }
 
-  // Compute content hash
+  if (!fetched.size) return
+
   const hash = await contentHash(fetched)
   const stateFile = join(STATE_ROOT, `${name}.hash`)
+  try {
+    if ((await readFile(stateFile, "utf8")).trim() === hash) return
+  } catch {}
 
-  // Skip if unchanged
-  if (existsSync(stateFile)) {
-    const existing = readFileSync(stateFile, "utf-8").trim()
-    if (existing === hash) {
-      return { name, files: fetched.size, hash }
-    }
-  }
-
-  // Write to disk
   const targetDir = join(SKILLS_ROOT, name)
-  rmSync(targetDir, { recursive: true, force: true })
-  mkdirSync(targetDir, { recursive: true })
-
-  for (const [p, content] of fetched) {
-    if (!isSafePath(p)) continue
-    const full = join(targetDir, p)
-    mkdirSync(dirname(full), { recursive: true })
-    writeFileSync(full, content)
+  await rm(targetDir, { recursive: true, force: true })
+  await mkdir(targetDir, { recursive: true })
+  for (const [file, content] of fetched) {
+    await writeFile(join(targetDir, file), content)
   }
-
-  mkdirSync(STATE_ROOT, { recursive: true })
-  writeFileSync(stateFile, hash)
-
+  await mkdir(STATE_ROOT, { recursive: true })
+  await writeFile(stateFile, hash)
   console.log(`[my-skills] [${index}] ${name}: wrote ${fetched.size} files`)
-  return { name, files: fetched.size, hash }
 }
 
-async function sync(entries: SkillEntry[]): Promise<void> {
-  // If the manifest itself hasn't changed, no point re-syncing.
-  const manifestStr = JSON.stringify(entries)
-  const manifestHash = await contentHash(
-    new Map([["manifest", new TextEncoder().encode(manifestStr)]]),
-  )
-  if (manifestHash === lastManifestHash) return
-  lastManifestHash = manifestHash
+async function prune(manifestNames: Set<string>): Promise<void> {
+  let stateFiles: string[]
+  try {
+    stateFiles = await readdir(STATE_ROOT)
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return
+    throw error
+  }
 
-  mkdirSync(SKILLS_ROOT, { recursive: true })
-  mkdirSync(STATE_ROOT, { recursive: true })
-
-  // Prune skills that were removed from the manifest
-  const currentNames = new Set(entries.map((e) => e.name ?? deriveName(e.url)))
-  for (const old of lastEntryNames) {
-    if (!currentNames.has(old)) {
-      rmSync(join(SKILLS_ROOT, old), { recursive: true, force: true })
-      rmSync(join(STATE_ROOT, `${old}.hash`), { force: true })
-      console.log(`[my-skills] pruned: ${old}`)
+  for (const stateFile of stateFiles) {
+    if (!stateFile.endsWith(".hash")) continue
+    const name = stateFile.slice(0, -5)
+    if (manifestNames.has(name)) continue
+    await rm(join(STATE_ROOT, stateFile), { force: true })
+    if (isSafePath(name)) {
+      await rm(join(SKILLS_ROOT, name), { recursive: true, force: true })
     }
   }
-  lastEntryNames = currentNames
-
-  // Sync all in parallel
-  await Promise.all(entries.map((e, i) => syncSkill(e, i)))
 }
 
-// ---- Plugin entry point ----
+export const MySkills = async (
+  _ctx: unknown,
+  options: PluginOptions = {},
+) => {
+  const refreshMs = options.refresh_ms ?? Number(
+    process.env.MY_SKILLS_REFRESH_MS ?? DEFAULT_REFRESH_MS,
+  )
+  const disabled = options.disabled ?? process.env.MY_SKILLS_DISABLED === "1"
+  let lastRefresh = 0
+  let inFlight: Promise<void> | null = null
 
-export const MySkills: Plugin = async (_ctx, options: PluginOptions = {}) => {
-  const skillsListPath = options.skills_list_path ?? SKILLS_LIST_PATH
-  const refreshMs = options.refresh_ms ?? REFRESH_INTERVAL_MS
-  const disabled = options.disabled ?? DISABLED
-  const token = options.github_token ?? GITHUB_TOKEN
+  async function run(): Promise<void> {
+    if (disabled || Date.now() - lastRefresh < refreshMs) return
+    if (inFlight) return inFlight
 
-  let lastRun = 0
-
-  async function run() {
-    if (disabled) return
-    if (Date.now() - lastRun < refreshMs) return
-    lastRun = Date.now()
-
-    let entries: SkillEntry[]
+    const currentRun = (async () => {
+      try {
+        const manifest = await readManifest()
+        if (!manifest) return
+        for (const [index, entry] of manifest.skills.entries()) {
+          await syncSkill(entry, index)
+        }
+        const manifestNames = new Set(
+          manifest.skills
+            .filter((entry) => typeof entry?.name === "string" && isSafePath(entry.name))
+            .map((entry) => entry.name),
+        )
+        await prune(manifestNames)
+        lastRefresh = Date.now()
+      } catch (error) {
+        console.warn(`[my-skills] sync failed: ${errorMessage(error)}`)
+      }
+    })()
+    inFlight = currentRun
     try {
-      const raw = JSON.parse(readFileSync(skillsListPath, "utf-8"))
-      entries = raw.map((e: any) =>
-        typeof e === "string"
-          ? { name: deriveName(e), url: e }
-          : (e as SkillEntry),
-      )
-    } catch (e: any) {
-      console.warn(`[my-skills] failed to read ${skillsListPath}: ${e.message}`)
-      return
+      await currentRun
+    } finally {
+      if (inFlight === currentRun) inFlight = null
     }
-
-    await sync(entries)
   }
 
   return {
-    "session.created": async () => {
+    "session.created": () => {
       void run()
     },
-    "session.idle": async () => {
+    "session.idle": () => {
       void run()
     },
   }

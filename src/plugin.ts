@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs"
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { homedir } from "node:os"
@@ -76,7 +77,17 @@ async function syncSkill(
   const hash = await contentHash(fetched)
   const stateFile = join(STATE_ROOT, `${name}.hash`)
   try {
-    if ((await readFile(stateFile, "utf8")).trim() === hash) return
+    const stateHash = (await readFile(stateFile, "utf8")).trim()
+    if (stateHash === hash) {
+      let allPresent = true
+      for (const file of entry.files) {
+        if (!isSafePath(file) || !existsSync(join(SKILLS_ROOT, name, file))) {
+          allPresent = false
+          break
+        }
+      }
+      if (allPresent) return
+    }
   } catch {}
 
   const targetDir = join(SKILLS_ROOT, name)

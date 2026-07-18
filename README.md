@@ -1,496 +1,588 @@
 # my-skills
 
-Self-hosted skills registry for Kilo. Skill files live in-repo under `skills/<name>/`, a `skills.json` manifest at the repo root lists which files belong to each skill, and the plugin (bundled in a tarball on Cloudflare Pages) fetches that manifest on every session start and writes the skill files to `~/.config/kilo/skills/<name>/`. No GitHub API calls at runtime, no per-content version bumps.
-
-## TL;DR
-
-Add to `~/.config/kilo/kilo.jsonc`:
+`my-skills` distributes a Kilo plugin through Cloudflare Pages and syncs skills from URLs in a remote manifest. Skill-content updates change the source or manifest; plugin-code updates change the versioned tarball.
 
 ```jsonc
 {
   "plugin": [
-    "my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz"
+    "my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.1.tgz"
   ]
 }
 ```
 
-Skill content updates do not require changing this URL.
+The consumer URL stays at `1.0.1` for content updates. Change it only when plugin code changes.
 
 ## How a request flows
 
-```
-Private GitHub repo
-  src/plugin.ts        plugin entry, hooks
-  src/lib.ts           SKILLS_BASE, manifest read, hashing
-  skills/<name>/...    skill content (SKILL.md, LICENSE...)
-  skills.json          manifest: name + files per skill
-  package.json         version + plugin metadata
-        | deploy (direct or git push)
-        v
-Cloudflare Pages (project: my-skills)
-  /my-skills-X.Y.Z.tgz   plugin tarball (stable URL)
-  /skills.json           manifest
-  /skills/<name>/<file>  skill files
-        | curl on first Kilo start
-        v
-Consumer's machine
-  ~/.config/kilo/kilo.jsonc
-    "plugin": ["my-skills@https://my-skills-atd.pages.dev/
-                my-skills-1.0.0.tgz"]
-  Bun downloads + extracts + installs deps + loads plugin
-        | session.created / session.idle
-        v
-Plugin sync (debounced by refresh_ms)
-  1. GET SKILLS_BASE/skills.json                   (manifest)
-  2. For each entry:
-       a. GET SKILLS_BASE/skills/<name>/<file>     (per file)
-       b. SHA-256 over sorted (path, content) pairs
-       c. Compare to ~/.config/kilo/.skill-state/<name>.hash
-       d. If unchanged, skip; else rm dir, write files, save hash
-  3. Prune skills removed from the manifest
+```text
+Maintainer
+  edit skills.json
         |
         v
-Skills on disk
-  ~/.config/kilo/skills/<name>/<file>     (Kilo reads)
-  ~/.config/kilo/.skill-state/<name>.hash (next-sync key)
+  npm run deploy
+        |
+        +--------------------+--------------------+------------------+
+        |                    |                    |
+        v                    v                    v
+  wrangler deploy      drag dist/ in CF     push origin/main
+        |                    |                    |
+        +--------------------+--------------------+
+                             |
+                             v
+Cloudflare Pages: https://my-skills-atd.pages.dev
+  /my-skills-1.0.1.tgz
+  /skills.json
+  /skills/<name>/<file>      legacy copies
+                             |
+                             v
+Consumer starts or idles a Kilo session
+  session.created / session.idle
+                             |
+                             v
+Plugin GETs SKILLS_BASE/skills.json
+                             |
+                             v
+For each entry: parseSource(entry.url) -> buildFileURL(...)
+        |
+        +-- GitHub folder/raw URL -> raw.githubusercontent.com -> fetch
+        |
+        +-- Other hostname -> <base>/skills/<name>/<file> -> fetch
+                             |
+                             v
+SHA-256 compare -> write changes -> prune removed skills
+  ~/.config/kilo/skills/<name>/<file>
+  ~/.config/kilo/.skill-state/<name>.hash
 ```
+
+The current manifest points to GitHub folders. Pages serves the manifest and plugin; the plugin fetches skill content from raw GitHub URLs. `dist/skills/` is legacy output not selected by the current manifest.
 
 ---
 
 ## 1. Configure with Kilo Code
 
-Kilo reads configs from (later wins): `~/.config/kilo/kilo.jsonc`, `~/.kilo/kilo.jsonc`, `./kilo.jsonc`, and managed locations (`/Library/Application Support/kilo/` on macOS, `/etc/kilo/` on Linux). For global install, edit `~/.config/kilo/kilo.jsonc`.
+### Config locations
 
-### 1.1 Add the plugin entry
+| Scope | Path |
+|---|---|
+| Global XDG location | `~/.config/kilo/kilo.jsonc` |
+| Project root | `./kilo.jsonc` |
+| Project config directory | `./.kilo/kilo.jsonc` |
+
+Kilo documentation states that `.kilo/kilo.jsonc` takes priority when both project forms exist.
+
+### Plugin entry
 
 ```jsonc
 {
   "plugin": [
-    "my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz"
+    "my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.1.tgz"
   ]
 }
 ```
 
-Bun's tarball URL format: `name@https://host/path/to/pkg-X.Y.Z.tgz`. Bun fetches, extracts, runs `bun install` to resolve `@kilocode/plugin` from the tarball's `dependencies`, then loads the entry point declared in `opencode.plugin` / `kilocode.plugin` (both point to `./src/plugin.ts`).
+The Bun tarball specifier is `<package-name>@https://<host>/<package-name>-<version>.tgz`. Kilo installs the package and dependencies, then loads `./src/plugin.ts`, which exports `MySkills`.
 
-The version in the URL only matters for plugin-code changes. Skill content edits do not require a version bump and do not require consumers to change this URL.
+### Plugin options
 
-### 1.2 Plugin options
-
-Use the tuple form:
+Use Kilo's plugin tuple form:
 
 ```jsonc
 {
   "plugin": [
     [
-      "my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz",
-      { "refresh_ms": 1800000 }
+      "my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.1.tgz",
+      { "refresh_ms": 1800000, "disabled": false }
     ]
   ]
 }
 ```
 
-| Option       | Default        | Purpose                                                    |
-|--------------|----------------|------------------------------------------------------------|
-| `refresh_ms` | `3600000` (1h) | Minimum time between syncs. `0` = sync every session.      |
-| `disabled`   | `false`        | `true` disables the plugin entirely (CI, debugging).       |
+| Option | Type | Default | Behavior |
+|---|---|---:|---|
+| `refresh_ms` | number | `3600000` | Minimum milliseconds between successful runs in one plugin instance. `0` checks every hook. |
+| `disabled` | boolean | `false` | `true` makes every sync hook return without fetching. |
 
-The base URL is not an option — use the `MY_SKILLS_BASE_URL` env var (1.3).
+### Environment variables
 
-### 1.3 Env vars
+| Variable | Default | Behavior |
+|---|---|---|
+| `MY_SKILLS_REFRESH_MS` | `3600000` | Converted with `Number()` when `refresh_ms` is absent. |
+| `MY_SKILLS_DISABLED` | unset | Exact value `1` disables sync when `disabled` is absent. |
+| `MY_SKILLS_BASE_URL` | `https://my-skills-atd.pages.dev` | Base used to fetch `/skills.json`. |
 
-| Env var                  | Equivalent                                              |
-|--------------------------|---------------------------------------------------------|
-| `MY_SKILLS_DISABLED=1`   | `{ "disabled": true }`                                  |
-| `MY_SKILLS_REFRESH_MS=N` | `{ "refresh_ms": N }`                                   |
-| `MY_SKILLS_BASE_URL=...` | Override the base URL (default `https://my-skills-atd.pages.dev`) |
+Explicit options take precedence over environment values. `MY_SKILLS_BASE_URL` is read by `src/lib.ts`; it is not a plugin option.
 
-Options take precedence. Useful for CI and staging:
-
-```bash
-MY_SKILLS_DISABLED=1 kilo run "test"
-MY_SKILLS_BASE_URL=https://staging.my-skills.pages.dev kilo run "test"
-```
-
-### 1.4 Verify
-
-After saving the config:
-
-1. **Reload VS Code window**: `Cmd+Shift+P` -> "Developer: Reload Window".
-2. **Check the manifest is reachable**: `curl -sSL https://my-skills-atd.pages.dev/skills.json | jq .`
-3. **Check the skill files appeared on disk**: `ls ~/.config/kilo/skills/`
-4. **Ask the agent**: `> what skills can you load?`
-5. **If a skill is missing**: `kilo run "test" 2>&1 | grep -i my-skills`
-
-### 1.5 Force a re-sync from disk
+### Verify
 
 ```bash
-rm -rf ~/.config/kilo/.skill-state ~/.config/kilo/skills/*
-# Restart Kilo Code session
+curl -fsS https://my-skills-atd.pages.dev/skills.json
 ```
 
-The next `session.created` writes fresh skills (the hash check is bypassed because no prior hash exists).
+Start a Kilo session and ask `What skills can you load?`. Synced files appear under `~/.config/kilo/skills/`.
 
 ---
 
-## 2. Deploy workflow
+## 2. Add a new skill
 
-Two scenarios: (A) editing skill content, (B) editing plugin code. Only B requires a version bump and a consumer URL change.
+This is the normal content workflow. Do not bump the package version.
 
-### 2.1 Add or edit a skill (no version bump)
+### Step 1: choose the source
 
-Drop a new folder under `skills/<name>/` and add an entry to `skills.json`:
+A skill needs a safe name, a GitHub folder URL or non-GitHub base URL, a literal file list, and anonymous HTTP access to every resulting URL.
 
-```bash
-mkdir -p skills/new-skill
-# ... write skills/new-skill/SKILL.md ...
+GitHub folder form:
+
+```text
+https://github.com/<owner>/<repo>/tree/<ref>/<path-to-skill>
 ```
 
-```jsonc
-{
-  "skills": [
-    { "name": "frontend-design",        "files": ["SKILL.md", "LICENSE.txt"] },
-    { "name": "web-design-guidelines",  "files": ["SKILL.md"] },
-    { "name": "animation-vocabulary",   "files": ["SKILL.md"] },
-    { "name": "new-skill",              "files": ["SKILL.md"] }
-  ]
-}
+Static-host form; the host must serve this path:
+
+```text
+<base>/skills/<name>/<file>
 ```
 
-`files` is the literal list of filenames to fetch for that skill. Paths are relative to `skills/<name>/` and become filenames under `~/.config/kilo/skills/<name>/`.
+### Step 2: edit `skills.json`
 
-Validate, then redeploy (see 2.3). Consumers pick up the change on their next session start. No URL change is needed on their side.
-
-### 2.2 Bump the plugin (required when changing plugin code)
-
-Plugin code lives in `src/plugin.ts` and `src/lib.ts`. Bumping is how consumers force re-download — Bun caches by URL, so without a bump, existing installations won't fetch the new tarball.
-
-```bash
-cd my-skills
-# Edit src/*.ts first
-npm version patch   # 1.0.0 -> 1.0.1
-# Then deploy (2.3)
-```
-
-Tell consumers to update their `kilo.jsonc`:
-
-```diff
--"my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz"
-+"my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.1.tgz"
-```
-
-### 2.3 Deploy methods
-
-Three ways, all targeting CF Pages project `my-skills`. Output dir is `dist`.
-
-#### A. Direct upload with wrangler (used this session)
-
-```bash
-npm install && npm run build   # produces dist/
-npx wrangler login             # once
-npx wrangler pages deploy dist --project-name my-skills
-```
-
-Skips git push. Deploy is immediate.
-
-#### B. Git push -> auto-build
-
-If CF Pages is connected to this repo via the Cloudflare GitHub App:
-
-```bash
-git add -A && git commit -m "feat: add new-skill" && git push origin main
-```
-
-CF Pages runs `npm run build` and deploys `dist/`. Dashboard must be set to "Build output directory: `dist`". ~30-90s end-to-end.
-
-#### C. Drag-and-drop
-
-CF dashboard -> Workers & Pages -> `my-skills` -> Create new deployment -> drag the `dist/` folder -> Deploy. Useful for one-offs without wrangler auth.
-
-### 2.4 End-to-end deploy checklist
-
-```bash
-# 1. Edit (content only -> no version bump)
-vim skills.json skills/<name>/SKILL.md
-# or (plugin code -> bump version):
-vim src/plugin.ts src/lib.ts && npm version patch
-
-# 2. Local build
-npm install && npm run build
-tar -tzf dist/my-skills-*.tgz   # package/{src,skills.json,skills/...}
-
-# 3. Deploy
-npx wrangler pages deploy dist --project-name my-skills
-# or: git push origin main
-
-# 4. Verify
-curl -sSL https://my-skills-atd.pages.dev/skills.json | jq .
-curl -sI https://my-skills-atd.pages.dev/skills/frontend-design/SKILL.md
-
-# 5. (Plugin bump only) Tell consumers to update kilo.jsonc URL
-```
-
-### 2.5 Roll back
-
-```bash
-git checkout v1.0.0
-npm install && npm run build
-npx wrangler pages deploy dist --project-name my-skills
-```
-
-Or `git revert HEAD && git push origin main`.
-
----
-
-## 3. Technical reference
-
-### 3.1 Architecture summary
-
-- **Source of truth**: GitHub repo (private). `skills.json` is the manifest. `skills/<name>/` holds the content. `src/plugin.ts` is the runtime.
-- **Distribution**: Cloudflare Pages serves both the plugin tarball and the static skill content from the same deployment at `https://my-skills-atd.pages.dev/`.
-- **Runtime**: Kilo (CLI or VS Code extension) downloads the tarball via Bun, installs dependencies, loads the plugin. Plugin fetches the manifest and each skill file directly from the same Pages deployment. No GitHub API at runtime.
-
-### 3.2 File layout
-
-```
-my-skills/
-├── package.json          version, plugin metadata, build scripts
-├── tsconfig.json         IDE support for src/*.ts
-├── skills.json           manifest: name + files per skill
-├── README.md             this file
-├── src/
-│   ├── plugin.ts         entry point, exports MySkills function
-│   └── lib.ts            SKILLS_BASE, readManifest, hashing, path safety
-├── skills/
-│   ├── frontend-design/SKILL.md
-│   ├── frontend-design/LICENSE.txt
-│   ├── web-design-guidelines/SKILL.md
-│   └── animation-vocabulary/SKILL.md
-└── dist/                 build output (gitignored)
-    ├── my-skills-X.Y.Z.tgz
-    ├── skills.json
-    └── skills/<name>/...
-```
-
-### 3.3 `package.json` fields that matter
-
-| Field             | Purpose                                                                       |
-|-------------------|-------------------------------------------------------------------------------|
-| `version`         | Bump only when plugin code changes. Appears in the tarball filename.          |
-| `main` / `exports["."]` / `opencode.plugin` / `kilocode.plugin` | All point to `./src/plugin.ts`. Required for Bun's tarball URL format. |
-| `files`           | Whitelist for `npm pack`: `src`, `skills`, `skills.json`, `README.md`.         |
-| `scripts.build`   | `clean && pack && copy-skills`. Runs on CF Pages.                             |
-| `dependencies`    | `{ "@kilocode/plugin": "latest" }`. Resolved by Bun at consumer install.       |
-
-### 3.4 Tarball layout (what Bun extracts)
-
-```
-my-skills-1.0.0.tgz
-└── package/
-    ├── package.json
-    ├── README.md
-    ├── skills.json
-    ├── src/
-    │   ├── plugin.ts
-    │   └── lib.ts
-    └── skills/<name>/...
-```
-
-`npm pack` always wraps files in a `package/` directory. Bun extracts and runs `bun install` to resolve deps. The tarball does NOT bake in any base URL — to migrate a consumer, set `MY_SKILLS_BASE_URL` for that consumer; no rebuild needed.
-
-### 3.5 Build pipeline
-
-```
-npm run build
-  -> clean          (rm -rf dist)
-  -> pack           (npm pack --pack-destination dist)
-       produces dist/my-skills-X.Y.Z.tgz
-  -> copy-skills    (cp -R skills/. dist/skills/ ; cp skills.json dist/skills.json)
-       produces dist/skills.json + dist/skills/<name>/<file>...
-```
-
-`dist/` is what CF Pages serves. Tarball and static content share the same deployment.
-
-### 3.6 Plugin lifecycle (when hooks fire)
-
-| Hook              | Fires when              | Plugin action                       |
-|-------------------|-------------------------|-------------------------------------|
-| `session.created` | New Kilo session starts | Sync (debounced by `refresh_ms`)    |
-| `session.idle`    | Session goes idle       | Sync (debounced) — catches long sessions |
-
-Both call the same `run()`. The first call after install always syncs; subsequent calls within `refresh_ms` are no-ops. Concurrent calls are de-duplicated (a second `run()` while one is in flight returns the same promise).
-
-The sync does:
-
-1. `readManifest()` — `fetch(SKILLS_BASE + "/skills.json", cache: "no-store")`. Returns `null` on non-2xx or invalid JSON.
-2. For each entry in `manifest.skills`:
-   - Validate `name` and every `file` against `isSafePath()` (no `..`, no slashes, no null bytes, must start with a letter).
-   - For each `file`, `fetch(SKILLS_BASE + "/skills/" + name + "/" + file, cache: "no-store")`. Skip failures with a warning; continue with whatever succeeded.
-   - If nothing succeeded, skip the entry.
-   - `contentHash(fetched)` — SHA-256 over sorted `(path, content)` pairs.
-   - Compare to `~/.config/kilo/.skill-state/<name>.hash`. If equal, skip.
-   - If different (or no prior hash), `rm` the target dir, mkdir, write each file, save new hash.
-3. `prune(manifestNames)` — remove `~/.config/kilo/skills/<name>/` and `<name>.hash` for any name in state that's no longer in the manifest.
-
-### 3.7 `skills.json` schema
-
-```jsonc
+```json
 {
   "skills": [
     {
       "name": "frontend-design",
+      "url": "https://github.com/anthropics/skills/tree/main/skills/frontend-design",
+      "files": ["SKILL.md", "LICENSE.txt"]
+    },
+    {
+      "name": "new-skill",
+      "url": "https://github.com/example/skills/tree/main/skills/new-skill",
+      "files": ["SKILL.md"]
+    }
+  ]
+}
+```
+
+`files` contains filenames, not nested paths. The plugin rejects empty values, names that do not start with a letter, `..`, `/`, `\`, and null bytes.
+
+### Step 3: build
+
+```bash
+npm run deploy
+```
+
+Or, on macOS:
+
+```bash
+npm run deploy:open
+```
+
+`deploy` builds `dist/` but does not upload. `deploy:open` builds the same directory and opens it in Finder.
+
+### Step 4: deploy
+
+| Path | Command or action |
+|---|---|
+| Wrangler CLI | `npm run deploy && wrangler pages deploy` |
+| Drag-and-drop | Run `npm run deploy:open`, then drag `dist/` to the `my-skills` Pages project. |
+| Git integration | Commit `skills.json` and push `origin main`. |
+
+### Step 5: consumer pickup
+
+No version bump, consumer config change, or extra restart is needed beyond the next session start. The plugin reads the manifest on the next eligible `session.created` or `session.idle` run; the default in-process debounce is one hour.
+
+If only an existing remote file changes, no registry rebuild is needed. The plugin fetches it again on its next eligible sync.
+
+### Add another static source target
+
+Set an entry's `url` to the new base:
+
+```json
+{
+  "name": "new-skill",
+  "url": "https://skills-example.pages.dev",
+  "files": ["SKILL.md"]
+}
+```
+
+It must serve `https://skills-example.pages.dev/skills/new-skill/SKILL.md`. Any hostname except `github.com` and `raw.githubusercontent.com` uses base-URL semantics; no plugin change is required.
+
+---
+
+## 3. Update plugin code
+
+Use this workflow only when `src/plugin.ts` or `src/lib.ts` changes.
+
+### Step 1: edit and verify
+
+```bash
+bun run scripts/parse-source-test.ts
+npx tsc --noEmit
+```
+
+### Step 2: bump the version
+
+```bash
+npm version patch
+```
+
+The version becomes part of `my-skills-X.Y.Z.tgz`, giving consumers a new download URL. The command updates `package.json` and `package-lock.json`.
+
+With npm's current `git-tag-version=true`, the default command requires a clean worktree and creates a version commit and tag. Commit source edits first. For an intentional local uncommitted build:
+
+```bash
+npm version patch --no-git-tag-version
+```
+
+### Step 3: build and deploy
+
+```bash
+npm run deploy
+```
+
+Deploy `dist/` through Wrangler, drag-and-drop, or Git integration.
+
+### Step 4: update consumers
+
+```diff
+-"my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.1.tgz"
++"my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.2.tgz"
+```
+
+Manifest-only and skill-content changes do not perform this step.
+
+---
+
+## 4. Deploy workflow
+
+The Pages project is `my-skills`, its production domain is `my-skills-atd.pages.dev`, and Cloudflare reports a connected Git provider.
+
+### Wrangler CLI
+
+```bash
+npm run deploy && wrangler pages deploy
+```
+
+Use for scripted deployment. `wrangler.toml` supplies the project name and output directory, so no `--project-name` or positional `dist` argument is needed. This path requires Wrangler authentication and no Git push.
+
+### Drag-and-drop
+
+```bash
+npm run deploy:open
+```
+
+This builds and runs `open dist`. Drag `dist/` to the `my-skills` project in the Pages dashboard. It needs no Wrangler CLI authentication.
+
+### Git push
+
+```bash
+git add skills.json
+git commit -m "feat: add new skill"
+git push origin main
+```
+
+Use when the connected Pages Git integration should build and deploy the commit.
+
+### Why `wrangler.toml` exists
+
+It keeps the Pages project name, output directory, compatibility date, and build command in source control. Cloudflare treats a deployed Wrangler configuration as the Pages configuration source of truth, reducing drift between direct and Git-connected deployments.
+
+```toml
+name = "my-skills"
+pages_build_output_dir = "dist"
+compatibility_date = "2024-01-01"
+
+[build]
+command = "npm run build"
+```
+
+### Verify after deployment
+
+```bash
+curl -fsS https://my-skills-atd.pages.dev/skills.json
+curl -fsSI https://my-skills-atd.pages.dev/my-skills-1.0.1.tgz
+```
+
+Then start a Kilo session and ask which skills are available.
+
+---
+
+## 5. Configuration reference
+
+### Consumer `kilo.jsonc`
+
+```jsonc
+{
+  "plugin": [
+    "my-skills@https://my-skills-atd.pages.dev/my-skills-1.0.1.tgz"
+  ]
+}
+```
+
+The full package URL is the code cache key. Keep it stable for content changes; update it after a plugin version bump.
+
+### `package.json`
+
+| Field | Current value | Purpose |
+|---|---|---|
+| `name` | `my-skills` | Package and tarball prefix. |
+| `version` | `1.0.1` | Tarball filename version. |
+| `type` | `module` | ES module mode. |
+| `main`, `exports["."]` | `./src/plugin.ts` | Package entry. |
+| `opencode.plugin`, `kilocode.plugin` | `./src/plugin.ts` | Plugin metadata entries. |
+| `files` | `src`, `skills`, `skills.json`, `README.md` | `npm pack` whitelist. |
+| `dependencies` | `@kilocode/plugin: latest` | Runtime dependency. |
+| `devDependencies` | `@types/bun`, `typescript` | Bun typing and TypeScript checks. |
+| `engines` | Bun `>=1.3.0`, Node `>=22.0.0` | Declared runtime floors. |
+| `license` | `MIT` | Plugin package license. |
+
+| Script | Exact command | Result |
+|---|---|---|
+| `build` | `npm run clean && npm run pack && npm run copy-skills` | Recreates deployment output. |
+| `clean` | `rm -rf dist` | Removes prior output. |
+| `pack` | `mkdir -p dist && npm pack --pack-destination dist` | Creates `dist/my-skills-X.Y.Z.tgz`. |
+| `copy-skills` | `mkdir -p dist/skills && cp -R skills/. dist/skills/ && cp skills.json dist/skills.json` | Copies manifest and legacy local skills. |
+| `deploy` | `npm run build` | Builds only. |
+| `deploy:open` | `npm run build && open dist` | Builds and opens Finder on macOS. |
+| `dev` | `bun run src/plugin.ts` | Executes the plugin module. |
+
+The current tarball contains `package.json`, `README.md`, `skills.json`, `src/`, and legacy `skills/` files.
+
+### `wrangler.toml`
+
+| Key | Value | Purpose |
+|---|---|---|
+| `name` | `my-skills` | Pages project name. |
+| `pages_build_output_dir` | `dist` | Published directory. |
+| `compatibility_date` | `2024-01-01` | Cloudflare runtime compatibility date. |
+| `build.command` | `npm run build` | Pages build command. |
+
+### `skills.json`
+
+```json
+{
+  "skills": [
+    {
+      "name": "frontend-design",
+      "url": "https://github.com/anthropics/skills/tree/main/skills/frontend-design",
       "files": ["SKILL.md", "LICENSE.txt"]
     }
   ]
 }
 ```
 
-| Field         | Type       | Required | Purpose                                          |
-|---------------|------------|----------|--------------------------------------------------|
-| `name`        | string     | yes      | Skill directory name under `skills/` and on disk under `~/.config/kilo/skills/`. |
-| `files`       | string[]   | yes      | Filenames to fetch from `SKILLS_BASE/skills/<name>/`. Written verbatim under `~/.config/kilo/skills/<name>/`. |
+| Field | Type | Required | Runtime use |
+|---|---|---|---|
+| `skills` | array | yes | Entries processed sequentially. |
+| `name` | string | yes | Target directory and state filename. |
+| `url` | string URL | yes | Input to `parseSource()`. |
+| `files` | string array | yes | Exact filenames fetched and written. |
 
-Unknown fields are ignored. Entries with invalid `name` or `files` are logged and skipped at sync time.
+The manifest comes from `${SKILLS_BASE}/skills.json`. Invalid top-level data returns `null`; invalid entries are logged and skipped. Only `name`, `url`, and `files` are consumed by `syncSkill()`.
 
-### 3.8 Content-hash details
+### `src/lib.ts`
 
-```
-hash = SHA-256(concat(sorted_keys, for each key: enc(key) || bytes(content)))
-```
-
-Sort keys alphabetically — same files in any order give the same hash. Any byte change or any file add/remove produces a different hash, triggering a re-write of the skill directory.
-
-### 3.9 Cache and on-disk layout
-
-```
-~/.cache/kilo/packages/my-skills@https:/my-skills-atd.pages.dev/my-skills-1.0.0.tgz/
-├── my-skills-1.0.0.tgz             # downloaded tarball
-└── node_modules/
-    ├── my-skills/                  # extracted plugin package (skills.json bundled but unused)
-    └── @kilocode/plugin/           # installed dependency
-
-~/.config/kilo/
-├── skills/<name>/<file>            # what the agent reads
-└── .skill-state/<name>.hash        # plugin's per-skill hash cache
+```ts
+export const SKILLS_BASE =
+  process.env.MY_SKILLS_BASE_URL || "https://my-skills-atd.pages.dev"
 ```
 
-### 3.10 Cloudflare Pages config
+| Export | Purpose |
+|---|---|
+| `readManifest()` | Fetches `${SKILLS_BASE}/skills.json` with `cache: "no-store"`. |
+| `parseSource(url)` | Classifies GitHub URLs or static-host bases. |
+| `buildFileURL(source, name, file)` | Builds one file URL. |
+| `isSafePath(path)` | Validates names and filenames. |
+| `contentHash(files)` | Computes SHA-256 for fetched files. |
 
-| Setting                | Value           |
-|------------------------|-----------------|
-| Build command          | `npm run build` |
-| Build output directory | `dist`          |
-| Root directory         | `/`             |
-| Node version           | 22              |
+`matchGlob()` and `filterFiles()` exist but `src/plugin.ts` does not call them.
 
-The same Pages project serves both `/my-skills-X.Y.Z.tgz` AND the static skill content at `/skills.json` and `/skills/<name>/<file>` — they deploy together because they share `dist/`.
+### Options and environment precedence
 
-**Direct deploy (no git integration)**:
+```text
+refresh_ms -> MY_SKILLS_REFRESH_MS -> 3600000
+disabled   -> MY_SKILLS_DISABLED === "1" -> false
+MY_SKILLS_BASE_URL -> https://my-skills-atd.pages.dev
+```
+
+Options use nullish precedence, so explicit `0` and `false` are preserved.
+
+### Other repository config
+
+- `tsconfig.json`: ES2022, ES modules, bundler resolution, strict checks, Bun types, and `src/**/*.ts` only. Used by `npx tsc --noEmit`; TypeScript source ships directly.
+- `package-lock.json`: locks the npm dependency graph. `npm version patch` updates its root version with `package.json`.
+- `.gitignore`: excludes `node_modules/`, `dist/`, `.DS_Store`, `._*`, `.env`, `.env.local`, `*.log`, and `.wrangler/`.
+
+---
+
+## 6. Technical reference
+
+### File layout
+
+```text
+Repository                         Cloudflare Pages
+my-skills/                         https://my-skills-atd.pages.dev/
+├── package.json                   ├── my-skills-1.0.1.tgz
+├── package-lock.json              ├── skills.json
+├── skills.json                    └── skills/<name>/<file>  legacy
+├── tsconfig.json
+├── wrangler.toml                  Consumer
+├── src/                           ~/.config/kilo/
+│   ├── plugin.ts                  ├── kilo.jsonc
+│   └── lib.ts                     ├── skills/<name>/<file>
+├── scripts/                       └── .skill-state/<name>.hash
+│   ├── integration-test.ts
+│   └── parse-source-test.ts
+├── skills/  legacy local copies
+└── dist/    generated output
+```
+
+The tarball wraps files under `package/` and includes `package.json`, `README.md`, `skills.json`, `src/`, and `skills/`. The plugin uses `homedir()` and fixed `.config/kilo` paths for synchronized files and state.
+
+### Plugin lifecycle
+
+`MySkills(_ctx, options)` computes `refreshMs` and `disabled`, then returns `session.created` and `session.idle` hooks. Both call the same debounced `run()`.
+
+```text
+hook -> run()
+  -> disabled / refresh window / in-flight guard
+  -> readManifest()
+  -> for each entry: syncSkill()
+       -> validate name and files
+       -> parseSource(url)
+       -> build and fetch each file URL, no-store
+       -> hash successful fetches
+       -> compare state hash
+       -> replace changed skill directory and hash
+  -> prune state names absent from manifest
+  -> record lastRefresh
+```
+
+Entries and files are sequential. A failed manifest does not advance `lastRefresh`. File failures are logged. If all files fail, the existing entry remains; if some succeed, that subset can replace the target directory.
+
+### Content hashing
+
+`contentHash()` sorts filenames, then concatenates each UTF-8 filename directly with its bytes and computes SHA-256:
+
+```text
+SHA-256(filename-1 || content-1 || filename-2 || content-2 || ...)
+```
+
+| State | Action |
+|---|---|
+| Hash missing or different | Remove target directory, write fetched files, save lowercase hex hash. |
+| Hash equal | Skip filesystem writes. |
+| State name absent from manifest | Delete its hash and skill directory. |
+
+### `parseSource()` and `buildFileURL()`
+
+| Hostname | Kind | Behavior |
+|---|---|---|
+| `github.com` | `github` | Parse owner, repo, ref, and path from tree, blob, or ref-style URL. |
+| `raw.githubusercontent.com` | `github` | Parse owner, repo, ref, and remaining path. |
+| Any other hostname | `cf` | Keep the URL as a base and remove one trailing slash. |
+
+GitHub example:
+
+```text
+https://github.com/anthropics/skills/tree/main/skills/frontend-design
+  -> https://raw.githubusercontent.com/anthropics/skills/main/skills/frontend-design/SKILL.md
+```
+
+If a GitHub blob/raw path ends in the requested filename, that segment is removed before appending the filename. Prefer folder URLs for entries with multiple files.
+
+Static-host example:
+
+```text
+https://my-skills-atd.pages.dev + frontend-design + SKILL.md
+  -> https://my-skills-atd.pages.dev/skills/frontend-design/SKILL.md
+```
+
+Non-root bases are preserved: `https://example.com/registry` becomes `https://example.com/registry/skills/<name>/<file>`.
+
+### Cloudflare Pages deploy model
+
+```text
+npm run build
+  -> clean: rm -rf dist
+  -> pack: npm pack --pack-destination dist
+       -> dist/my-skills-X.Y.Z.tgz
+  -> copy-skills
+       -> dist/skills.json
+       -> dist/skills/<name>/<file>
+```
+
+Pages publishes `dist/`. Wrangler, dashboard upload, and Git integration deploy the same artifact model. The copied skill tree remains legacy output because current manifest URLs point to GitHub.
+
+### Cache layers
+
+| Layer | Cached object | Update rule |
+|---|---|---|
+| Kilo/Bun install | Plugin tarball and dependencies | Full plugin specifier, including tarball URL. |
+| Runtime sync | Manifest and source responses | `cache: "no-store"`, `refresh_ms`, and per-skill hash. |
+
+Content changes need no tarball update. Code changes need a new tarball filename and consumer URL.
+
+### Security model
+
+- The current GitHub origin is public. The Pages deployment is public.
+- The architecture can use a private registry repository if Cloudflare Git integration can read it, but that is not the current repository visibility.
+- Manifest source URLs must be anonymously fetchable; the runtime has no source-host credential setting.
+- The tarball contains only the `npm pack` whitelist. `.env` files are not packed.
+- Never place secrets in `README.md`, `skills.json`, `src/`, or `skills/`; Pages makes packed and copied output downloadable.
+
+### Troubleshooting
+
+#### Skills do not load
+
+1. Confirm the consumer tarball URL and deployed manifest.
+2. Check `disabled`, `MY_SKILLS_DISABLED`, and the one-hour default refresh window.
+3. Inspect `~/.config/kilo/skills/` and `~/.config/kilo/.skill-state/`.
+4. Start a session and ask which skills are available.
 
 ```bash
-npx wrangler pages deploy dist --project-name my-skills
+curl -fsS https://my-skills-atd.pages.dev/skills.json
 ```
 
-**Git-connected deploy**: Cloudflare GitHub App installed on the repo. CF Pages -> Create -> Pages -> Connect to Git -> select this repo -> configure build (command `npm run build`, output `dist`) -> Save and Deploy.
+If a hash exists but its skill directory was manually removed, delete that skill's hash before syncing; an equal hash skips writes.
 
-**Branch previews**: every branch gets `https://<commit-hash>.my-skills-atd.pages.dev/...`. Useful for testing before merging.
+#### Source parsing or fetch fails
 
-**Custom domain**: Pages -> Custom domains -> enter `skills.example.com`. Cloudflare auto-provisions SSL.
+Use `https://github.com/<owner>/<repo>/tree/<ref>/<folder>` for GitHub folders. Confirm every computed raw URL, or every static `<base>/skills/<name>/<file>` URL, returns success. Filenames are case-sensitive.
 
-### 3.11 Security model
+A partial fetch is important: if one file succeeds, the successful subset can replace the local directory.
 
-- **Source repo is private.** Only collaborators see the build config, `skills.json`, plugin code.
-- **CF Pages deployment is public.** The tarball and the static content are served over HTTPS to anyone who knows the URL.
-- **The tarball contains no secrets** — only plugin code and metadata.
-- **No tokens at runtime.** The plugin does not call GitHub. No rate limits to worry about, only CF Pages serving limits.
-- **Static content is content-only.** `dist/skills/<name>/*.md|txt` — no executable code, no secrets.
+#### Git integration does not build
 
-### 3.12 Troubleshooting
+1. Confirm the Pages project is connected to the Git provider and `main` is the production branch.
+2. Confirm root `wrangler.toml` has `command = "npm run build"` and `pages_build_output_dir = "dist"`.
+3. Run `npm run deploy` locally.
+4. Inspect the Cloudflare build log for the failing install, build, or upload step.
 
-**Plugin doesn't load at all**
+#### Deployed content is stale
 
-```bash
-curl -sI https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz          # expect 200
-tar -tzf <(curl -sSL https://my-skills-atd.pages.dev/my-skills-1.0.0.tgz)
-# expect: package/src/plugin.ts, package/skills.json, package/skills/<name>/...
-kilo run "test" 2>&1 | grep -i my-skills
-```
+Compare production `/skills.json` with local `dist/skills.json`. Runtime requests use `cache: "no-store"`; remaining delay comes from `refresh_ms`, source failure, or publishing the wrong `dist/`.
 
-**Skills don't appear after install**
+### Maintainer checklist
 
-```bash
-curl -sSL https://my-skills-atd.pages.dev/skills.json | jq .
-ls ~/.config/kilo/skills/        # should list skills
-ls ~/.config/kilo/.skill-state/  # should have <name>.hash files
+#### Skill or manifest change
 
-# Force re-sync
-rm -rf ~/.config/kilo/.skill-state ~/.config/kilo/skills/*
-# Restart Kilo Code session (Cmd+Shift+P -> Reload Window)
-```
+- [ ] Add or update `name`, `url`, and `files` in `skills.json`.
+- [ ] Confirm each computed source URL.
+- [ ] Run `npm run deploy` and inspect `dist/skills.json`.
+- [ ] Deploy through Wrangler, drag-and-drop, or Git push.
+- [ ] Verify production with `curl` and a Kilo session.
+- [ ] Do not bump the plugin version or change consumer config.
 
-**Plugin fires but a single file fails**
+#### Plugin-code change
 
-The plugin logs `[my-skills] [N] <name>: <file> fetch failed: <status>` and continues with whatever succeeded. A 404 means the file isn't at the expected path in `dist/skills/<name>/` — re-check the `files` array in `skills.json` matches what's in the repo.
+- [ ] Edit the required `src/*.ts` files.
+- [ ] Run `bun run scripts/parse-source-test.ts` and `npx tsc --noEmit`.
+- [ ] Commit source edits, then run `npm version patch`.
+- [ ] Run `npm run deploy` and confirm the new tarball filename.
+- [ ] Deploy, verify the tarball URL, and update consumer configs.
 
-**Stale skill content**
+#### Release hygiene
 
-Bun caches the tarball by URL. The static content is fetched on every sync with `cache: "no-store"`, so `refresh_ms` is the only delay. Force immediate pickup:
-
-```bash
-rm -rf ~/.config/kilo/.skill-state ~/.config/kilo/skills/*
-# Restart session
-```
-
-**Tarball not updating on CF Pages**
-
-```bash
-npx wrangler pages deployment list --project-name my-skills
-# Latest should be "Active". If failed, open the Build link in the dashboard.
-```
-
-Common build failures:
-- `npm install` fails -> Node version must be 22+
-- `npm pack` produces 0 files -> `files` field in package.json is missing/wrong
-- Build succeeds but `dist/` empty -> `npm pack --pack-destination` requires npm 9+
-- Static content missing from deploy -> `copy-skills` didn't run; check `npm run build` output
-
-**Agent says "no skills loaded"**
-
-The skill list is loaded at session start. Config changes require a session restart.
-
-**Stale `skills.json` at the edge**
-
-The plugin always fetches `${SKILLS_BASE}/skills.json` with `cache: "no-store"`. If you see old entries, the deployment didn't replace the file:
-
-```bash
-curl -sSL https://my-skills-atd.pages.dev/skills.json | jq .
-```
-
-Compare against `dist/skills.json` from the build.
-
-### 3.13 File reference
-
-**`src/plugin.ts`** (entry point): exports `MySkills(ctx, options)` returning `{ "session.created", "session.idle" }` hooks. Internally calls `readManifest()` and `syncSkill()` per entry.
-
-**`src/lib.ts`** helpers:
-
-| Export                       | Purpose                                                                  |
-|------------------------------|--------------------------------------------------------------------------|
-| `SKILLS_BASE`                | `process.env.MY_SKILLS_BASE_URL ?? "https://my-skills-atd.pages.dev"`    |
-| `readManifest()`             | `fetch(SKILLS_BASE + "/skills.json", no-store)`. Returns `{skills}` or `null`. |
-| `contentHash(files)`         | SHA-256 over sorted `(path, content)` pairs.                             |
-| `isSafePath(p)`              | Reject empty, non-letter-start, `..`, `/`, `\`, null bytes.              |
-| `matchGlob` / `filterFiles`  | Glob helpers (defined; not consumed by current `syncSkill`).             |
-
-### 3.14 Maintainer checklist
-
-- [ ] Skill content changes only touch `skills/<name>/` and `skills.json`.
-- [ ] Plugin-code changes bump `package.json` version and update consumer URLs.
-- [ ] `npm run build` produces a `dist/` that matches what CF Pages deploys.
-- [ ] `npx wrangler pages deployment list --project-name my-skills` shows the latest deploy as `Active`.
-- [ ] `curl -sSL https://my-skills-atd.pages.dev/skills.json | jq .` shows the current manifest.
-- [ ] `curl -sI https://my-skills-atd.pages.dev/skills/<name>/<file>` returns 200 for every `(name, file)` pair in `skills.json`.
-
-## License
-
-MIT. The skills you bundle have their own licenses — respect them.
+- [ ] Keep `wrangler.toml`, `package.json`, `skills.json`, and this README consistent.
+- [ ] Keep secrets outside packed and copied paths.
+- [ ] Keep `dist/`, local environment files, and Wrangler state untracked.
+- [ ] Preserve upstream license files in `files` when required.

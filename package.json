@@ -24,6 +24,8 @@
     "pack": "mkdir -p dist && npm pack --pack-destination dist",
     "copy-skills": "mkdir -p dist/skills && cp -R skills/. dist/skills/ && cp skills.json dist/skills.json",
     "clean": "rm -rf dist",
+    "deploy": "npm run build",
+    "deploy:open": "npm run build && open dist",
     "dev": "bun run src/plugin.ts"
   },
   "dependencies": {

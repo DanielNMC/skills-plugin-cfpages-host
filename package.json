@@ -1,6 +1,6 @@
 {
   "name": "my-skills",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "description": "Self-hosted skills registry. Kilo/OpenCode plugin distributed as a tarball via Cloudflare Pages. Private source, public install.",
   "main": "./src/plugin.ts",

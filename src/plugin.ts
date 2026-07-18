@@ -4,8 +4,10 @@ import { homedir } from "node:os"
 
 import {
   SKILLS_BASE,
+  buildFileURL,
   contentHash,
   isSafePath,
+  parseSource,
   readManifest,
   type SkillEntry,
 } from "./lib"
@@ -39,13 +41,22 @@ async function syncSkill(
     return
   }
 
+  const url = typeof entry?.url === "string" ? entry.url : ""
+  let source
+  try {
+    source = parseSource(url)
+  } catch (error) {
+    console.warn(
+      `[my-skills] [${index}] ${name}: bad url: ${errorMessage(error)}`,
+    )
+    return
+  }
+
   const fetched = new Map<string, Uint8Array>()
   for (const file of entry.files) {
     try {
-      const response = await fetch(
-        `${SKILLS_BASE}/skills/${encodeURIComponent(name)}/${encodeURIComponent(file)}`,
-        { cache: "no-store" },
-      )
+      const fileURL = buildFileURL(source, name, file)
+      const response = await fetch(fileURL, { cache: "no-store" })
       if (!response.ok) {
         console.warn(
           `[my-skills] [${index}] ${name}: ${file} fetch failed: ${response.status}`,

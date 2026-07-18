@@ -9,13 +9,42 @@ const configRoot = join(homedir(), ".config", "kilo")
 const skillsRoot = join(configRoot, "skills")
 const stateRoot = join(configRoot, ".skill-state")
 
+const GITHUB_ANIMATION =
+  "https://github.com/emilkowalski/skills/tree/main/skills/animation-vocabulary"
+
+const manifest = {
+  skills: [
+    {
+      name: "frontend-design",
+      url: "PLACEHOLDER_BASE",
+      files: ["SKILL.md", "LICENSE.txt"],
+    },
+    {
+      name: "web-design-guidelines",
+      url: "PLACEHOLDER_BASE",
+      files: ["SKILL.md"],
+    },
+    {
+      name: "animation-vocabulary",
+      url: GITHUB_ANIMATION,
+      files: ["SKILL.md"],
+    },
+  ],
+}
+
 const server = Bun.serve({
   port: 0,
   async fetch(request) {
     const pathname = new URL(request.url).pathname
     if (request.method !== "GET") return new Response("Not found", { status: 404 })
     if (pathname === "/skills.json") {
-      return new Response(Bun.file(join(root, "skills.json")))
+      const body = JSON.stringify(manifest).replaceAll(
+        "PLACEHOLDER_BASE",
+        `http://localhost:${server.port}`,
+      )
+      return new Response(body, {
+        headers: { "content-type": "application/json" },
+      })
     }
     const match = pathname.match(/^\/skills\/([^/]+)\/([^/]+)$/)
     if (!match) return new Response("Not found", { status: 404 })
@@ -35,7 +64,7 @@ try {
   const mod = await import("../src/plugin.ts")
   const hooks = await mod.MySkills({} as any, {} as any)
   await hooks["session.created"]({} as any)
-  await Bun.sleep(5000)
+  await Bun.sleep(10000)
 
   const expectedFiles = [
     join(skillsRoot, "frontend-design", "SKILL.md"),
@@ -51,6 +80,17 @@ try {
     join(stateRoot, "animation-vocabulary.hash"),
   ]
   for (const file of stateFiles) assert(existsSync(file), file)
+
+  const { readFileSync } = await import("node:fs")
+  const animContent = readFileSync(
+    join(skillsRoot, "animation-vocabulary", "SKILL.md"),
+    "utf8",
+  )
+  assert(
+    animContent.includes("animation") || animContent.length > 50,
+    `animation-vocabulary SKILL.md looks empty: ${animContent.length} bytes`,
+  )
+
   console.log("integration test passed")
 } catch (error) {
   failed = true

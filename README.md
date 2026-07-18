@@ -542,7 +542,20 @@ Content changes need no tarball update. Code changes need a new tarball filename
 curl -fsS https://my-skills-atd.pages.dev/skills.json
 ```
 
-If a hash exists but its skill directory was manually removed, delete that skill's hash before syncing; an equal hash skips writes.
+The plugin now self-recovers from missing on-disk files (the hash check also verifies files exist before skipping). If a skill still doesn't appear after reload, see the next item.
+
+#### Stale plugin code after deploy
+
+If a deploy succeeded but the agent still behaves as if running the previous plugin version, the local Bun tarball cache holds old bytes. Bun caches by URL — same URL = same cache entry — so re-deploying the same `my-skills-X.Y.Z.tgz` does not invalidate the cache.
+
+Run the helper to force a fresh download on the next session:
+
+```bash
+bash scripts/clear-cache.sh
+# Then reload VSCodium: Cmd+Shift+P -> "Developer: Reload Window"
+```
+
+This deletes `~/.cache/kilo/packages/my-skills@https:/` and `~/.bun/install/cache/https:/my-skills-atd.pages.dev/`. The next Kilo startup re-downloads the tarball. Idempotent and scoped to my-skills only — leaves other plugins and state intact.
 
 #### Source parsing or fetch fails
 
@@ -553,13 +566,13 @@ A partial fetch is important: if one file succeeds, the successful subset can re
 #### Git integration does not build
 
 1. Confirm the Pages project is connected to the Git provider and `main` is the production branch.
-2. Confirm root `wrangler.toml` has `command = "npm run build"` and `pages_build_output_dir = "dist"`.
+2. Confirm root `wrangler.toml` has `pages_build_output_dir = "dist"`. The `[build] command` is **not** supported in `wrangler.toml` for Pages — set the build command in the Pages dashboard instead.
 3. Run `npm run deploy` locally.
 4. Inspect the Cloudflare build log for the failing install, build, or upload step.
 
 #### Deployed content is stale
 
-Compare production `/skills.json` with local `dist/skills.json`. Runtime requests use `cache: "no-store"`; remaining delay comes from `refresh_ms`, source failure, or publishing the wrong `dist/`.
+Compare production `/skills.json` with local `dist/skills.json`. Runtime requests use `cache: "no-store"`; remaining delay comes from `refresh_ms`, source failure, or publishing the wrong `dist/`. For plugin code changes, see "Stale plugin code after deploy" above.
 
 ### Maintainer checklist
 
